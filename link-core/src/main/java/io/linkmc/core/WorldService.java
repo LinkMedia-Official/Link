@@ -30,8 +30,9 @@ public final class WorldService implements Worlds, AutoCloseable {
     }
     public CompletionStage<List<String>> templates(){return run(templates::list);}
     public CompletionStage<WorldInfo> createEditor(String name){LinkApi.requireName(name);return run(() -> driver.createEditor(name));}
-    public CompletionStage<Void> publish(String editor,String template,int version){return run(() -> {templates.publish(template,version,driver.snapshot(editor));return null;});}
-    public CompletionStage<WorldInfo> create(String name,String template,int version,boolean persistent){LinkApi.requireName(name);return run(() -> driver.instantiate(name,templates.read(template,version),persistent));}
+    public CompletionStage<Void> publish(String editor,String template,int version){LinkApi.requireName(editor);LinkApi.requireName(template);version(version);return run(() -> {templates.publish(template,version,driver.snapshot(editor));return null;});}
+    public CompletionStage<WorldInfo> create(String name,String template,int version,boolean persistent){LinkApi.requireName(name);LinkApi.requireName(template);version(version);return run(() -> driver.instantiate(name,templates.read(template,version),persistent));}
+    private static void version(int version){if(version<1)throw new IllegalArgumentException("Template version must be positive");}
     public CompletionStage<WorldInfo> load(String name){return run(() -> driver.load(name));}
     public CompletionStage<Void> save(String name){return run(() -> {driver.save(name);return null;});}
     public CompletionStage<Void> unload(String name){return run(() -> {driver.unload(name);return null;});}

@@ -27,8 +27,12 @@ public final class NetworkStore {
             try(var check=sql(c,"SELECT node,world FROM link_channels WHERE id=?",id);var row=check.executeQuery()){
                 if(row.next()&&(!row.getString(1).equals(spawn.node())||!row.getString(2).equals(spawn.world())))throw new ConflictException("Channel ID belongs to another world");
             }
+            String channel=id;
+            try(var check=sql(c,"SELECT id FROM link_channels WHERE node=? AND world=?",spawn.node(),spawn.world());var row=check.executeQuery()){
+                if(row.next())channel=row.getString(1);
+            }
             update(c,"INSERT INTO link_channels(id,node,world,capacity,ready,x,y,z,yaw,pitch) VALUES (?,?,?,?,true,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET capacity=excluded.capacity,ready=true,x=excluded.x,y=excluded.y,z=excluded.z,yaw=excluded.yaw,pitch=excluded.pitch",
-                    id,spawn.node(),spawn.world(),capacity,spawn.x(),spawn.y(),spawn.z(),spawn.yaw(),spawn.pitch());
+                    channel,spawn.node(),spawn.world(),capacity,spawn.x(),spawn.y(),spawn.z(),spawn.yaw(),spawn.pitch());
 
             return null;
         });
@@ -45,9 +49,13 @@ public final class NetworkStore {
         });
     }
     public List<Channel> channels() throws Exception {
+        return channels(false);
+    }
+    public List<Channel> spawnChannels() throws Exception {return channels(true);}
+    private List<Channel> channels(boolean spawnOnly) throws Exception {
         return db.transaction(c -> {
             List<Channel> result=new ArrayList<>();
-            try(var s=sql(c,"SELECT c.id,c.node,c.world,c.capacity,count(r.id) FILTER(WHERE r.state='ADMITTED') AS occupied,count(DISTINCT r.player)-count(DISTINCT r.player) FILTER(WHERE r.state='ADMITTED') AS reserved FROM link_channels c JOIN link_nodes n ON n.id=c.node LEFT JOIN link_reservations r ON r.channel=c.id AND r.expires_at>clock_timestamp() WHERE c.ready AND n.heartbeat>clock_timestamp()-interval '15 seconds' GROUP BY c.id,c.node,c.world,c.capacity ORDER BY c.id"); var r=s.executeQuery()) {
+            try(var s=sql(c,"SELECT c.id,c.node,c.world,c.capacity,count(r.id) FILTER(WHERE r.state='ADMITTED') AS occupied,count(DISTINCT r.player)-count(DISTINCT r.player) FILTER(WHERE r.state='ADMITTED') AS reserved FROM link_channels c JOIN link_nodes n ON n.id=c.node LEFT JOIN link_reservations r ON r.channel=c.id AND r.expires_at>clock_timestamp() WHERE c.ready AND "+(spawnOnly?"c.spawn_enabled AND ":"")+"n.heartbeat>clock_timestamp()-interval '15 seconds' GROUP BY c.id,c.node,c.world,c.capacity ORDER BY c.id"); var r=s.executeQuery()) {
                 while(r.next()) result.add(new Channel(r.getString("id"),r.getString("node"),r.getString("world"),r.getInt("capacity"),r.getInt("occupied"),r.getInt("reserved")));
             }
             return List.copyOf(result);
@@ -77,7 +85,10 @@ public final class NetworkStore {
             }
             String query="SELECT c.* FROM link_channels c JOIN link_nodes n ON n.id=c.node WHERE c.ready AND n.heartbeat>clock_timestamp()-interval '15 seconds' AND (SELECT count(DISTINCT r.player) FROM link_reservations r WHERE r.channel=c.id AND r.player<>?)<c.capacity AND (SELECT count(DISTINCT r.player) FROM link_reservations r JOIN link_channels nc ON nc.id=r.channel WHERE nc.node=c.node AND r.player<>?)<n.capacity ORDER BY (SELECT count(*) FROM link_reservations r WHERE r.channel=c.id) DESC,c.id LIMIT 1";
             if(target!=null)query=query.replace("WHERE c.ready AND", "WHERE c.node=? AND c.world=? AND c.ready AND");
-            try(var s=target==null?sql(c,query,player,player):sql(c,query,target.node(),target.world(),player,player); var r=s.executeQuery()) {
+            else query=query.replace("WHERE c.ready AND", "WHERE c.spawn_enabled AND c.ready AND");
+            // Existing players prefer their current backend; first admission still balances normally.
+            if(target==null)query=query.replace("ORDER BY (SELECT", "ORDER BY CASE WHEN c.node=(SELECT node FROM link_sessions WHERE player=? AND state='ACTIVE' AND expires_at>clock_timestamp()) THEN 0 ELSE 1 END, (SELECT");
+            try(var s=target==null?sql(c,query,player,player,player):sql(c,query,target.node(),target.world(),player,player); var r=s.executeQuery()) {
                 if(!r.next()) throw new ConflictException("NO_CAPACITY: provision a ready spawn before retrying");
                 String channel=r.getString("id");
                 Destination destination=target!=null?target:new Destination(r.getString("node"),r.getString("world"),r.getDouble("x"),r.getDouble("y"),r.getDouble("z"),r.getFloat("yaw"),r.getFloat("pitch"));
@@ -114,7 +125,7 @@ public final class NetworkStore {
         });
     }
     public int channelCount(String node) throws Exception {
-        return db.transaction(c -> {try(var s=sql(c,"SELECT count(*) FROM link_channels WHERE node=?",node);var r=s.executeQuery()){r.next();return r.getInt(1);}});
+        return db.transaction(c -> {try(var s=sql(c,"SELECT count(*) FROM link_channels WHERE node=? AND spawn_enabled",node);var r=s.executeQuery()){r.next();return r.getInt(1);}});
     }
     public Optional<Destination> warp(String name) throws Exception {
         LinkApi.requireName(name);
@@ -125,8 +136,63 @@ public final class NetworkStore {
         });
     }
     public void setWarp(String name, Destination d) throws Exception {
+        setWarp(name,d,0);
+    }
+    public void setWarp(String name,Destination d,int capacity)throws Exception{
         LinkApi.requireName(name);
-        db.transaction(c -> { update(c,"INSERT INTO link_warps(name,node,world,x,y,z,yaw,pitch) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET node=excluded.node,world=excluded.world,x=excluded.x,y=excluded.y,z=excluded.z,yaw=excluded.yaw,pitch=excluded.pitch",name,d.node(),d.world(),d.x(),d.y(),d.z(),d.yaw(),d.pitch()); return null; });
+        if(capacity<0)throw new IllegalArgumentException("Invalid capacity");
+        db.transaction(c->{
+            lock(c,"warp:"+name);
+            if(capacity>0){
+                lock(c,"allocation");
+                boolean exists;
+                try(var s=sql(c,"SELECT 1 FROM link_channels WHERE node=? AND world=?",d.node(),d.world());var r=s.executeQuery()){exists=r.next();}
+                if(!exists){
+                    String id="warp-"+UUID.randomUUID();
+                    update(c,"INSERT INTO link_channels(id,node,world,capacity,ready,x,y,z,yaw,pitch,spawn_enabled) VALUES (?,?,?,?,true,?,?,?,?,?,false)",id,d.node(),d.world(),capacity,d.x(),d.y(),d.z(),d.yaw(),d.pitch());
+                }
+            }
+            recordWarp(c,name,new com.google.gson.Gson().toJson(d).getBytes(java.nio.charset.StandardCharsets.UTF_8),"warp:set");
+            update(c,"INSERT INTO link_warps(name,node,world,x,y,z,yaw,pitch) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET node=excluded.node,world=excluded.world,x=excluded.x,y=excluded.y,z=excluded.z,yaw=excluded.yaw,pitch=excluded.pitch",name,d.node(),d.world(),d.x(),d.y(),d.z(),d.yaw(),d.pitch());return null;
+        });
+    }
+    private void recordWarp(Connection c,String name,byte[] value,String type)throws Exception{
+        String id=LinkApi.warpStateId(name);long version=EventStore.read(c,id).map(State::version).orElse(0L);
+        new EventStore(db).commit(c,new Transaction(UUID.randomUUID(),List.of(),List.of(new Change(id,version,1,type,value))));
+    }
+    public boolean deleteWarp(String name)throws Exception{
+        LinkApi.requireName(name);
+        return db.transaction(c->{
+            lock(c,"warp:"+name);
+            if(update(c,"DELETE FROM link_warps WHERE name=?",name)==0)return false;
+            recordWarp(c,name,new byte[0],"warp:delete");return true;
+        });
+    }
+    public List<String> warps()throws Exception{
+        return db.transaction(c->{List<String> names=new ArrayList<>();try(var s=sql(c,"SELECT name FROM link_warps ORDER BY name");var r=s.executeQuery()){while(r.next())names.add(r.getString(1));}return List.copyOf(names);});
+    }
+    public void syncWarpWorlds(String node,Collection<String> loaded)throws Exception{
+        db.transaction(c->{lock(c,"allocation");try(var s=sql(c,"SELECT id,world,ready FROM link_channels WHERE node=? AND NOT spawn_enabled",node);var r=s.executeQuery()){
+            while(r.next()){boolean ready=loaded.contains(r.getString(2));if(ready!=r.getBoolean(3))update(c,"UPDATE link_channels SET ready=? WHERE id=?",ready,r.getString(1));}
+        }return null;});
+    }
+    public void closeWorld(String node,String world)throws Exception{
+        db.transaction(c->{lock(c,"allocation");
+            try(var s=sql(c,"SELECT 1 FROM link_reservations r JOIN link_channels c ON c.id=r.channel WHERE c.node=? AND c.world=? AND (r.state='ADMITTED' OR r.expires_at>clock_timestamp())",node,world);var r=s.executeQuery()){
+                if(r.next())throw new ConflictException("World still has admissions or pending travel");
+            }
+            update(c,"UPDATE link_channels SET ready=false WHERE node=? AND world=?",node,world);return null;
+        });
+    }
+    public void openWarpWorld(String node,String world)throws Exception{
+        db.transaction(c->{lock(c,"allocation");update(c,"UPDATE link_channels SET ready=true WHERE node=? AND world=? AND NOT spawn_enabled",node,world);return null;});
+    }
+    public void prepareDestination(Destination d,int capacity)throws Exception{
+        if(capacity<1)throw new IllegalArgumentException("Invalid capacity");
+        db.transaction(c->{lock(c,"allocation");
+            try(var s=sql(c,"SELECT 1 FROM link_channels WHERE node=? AND world=?",d.node(),d.world());var r=s.executeQuery()){if(r.next())return null;}
+            update(c,"INSERT INTO link_channels(id,node,world,capacity,ready,x,y,z,yaw,pitch,spawn_enabled) VALUES (?,?,?,?,true,?,?,?,?,?,false)","warp-"+UUID.randomUUID(),d.node(),d.world(),capacity,d.x(),d.y(),d.z(),d.yaw(),d.pitch());return null;
+        });
     }
     private static Reservation reservation(ResultSet r) throws SQLException {
         return new Reservation(r.getObject("id",UUID.class),r.getObject("player",UUID.class),r.getString("channel"),new Destination(r.getString("node"),r.getString("world"),r.getDouble("x"),r.getDouble("y"),r.getDouble("z"),r.getFloat("yaw"),r.getFloat("pitch")),instant(r,"expires_at"));

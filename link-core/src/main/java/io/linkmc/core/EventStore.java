@@ -31,8 +31,10 @@ public final class EventStore {
         }
     }
     public Commit commit(Transaction tx) throws Exception {
+        return db.transaction(c -> commit(c,tx));
+    }
+    Commit commit(Connection c,Transaction tx) throws Exception {
         byte[] digest = digest(tx);
-        return db.transaction(c -> {
             lock(c, "operation:" + tx.operation());
             try (var s = sql(c, "SELECT digest FROM link_operations WHERE id=?", tx.operation()); var r = s.executeQuery()) {
                 if (r.next()) {
@@ -66,7 +68,6 @@ public final class EventStore {
             }
             update(c, "INSERT INTO link_outbox(id) VALUES (?)", tx.operation());
             return new Commit(tx.operation(), false);
-        });
     }
     public List<Event> history(String id, long after, int limit) throws Exception {
         if (after < 0 || limit < 1 || limit > 1000) throw new IllegalArgumentException("Invalid event page");

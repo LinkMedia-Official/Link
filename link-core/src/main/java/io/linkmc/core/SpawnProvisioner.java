@@ -21,7 +21,7 @@ public final class SpawnProvisioner {
     public CompletionStage<Boolean> ensureSpare(double x,double y,double z,float yaw,float pitch){
         if(!creating.compareAndSet(false,true))return CompletableFuture.completedFuture(false);
         try {
-            var local=network.channels().stream().filter(c -> c.node().equals(node)).toList();
+            var local=network.spawnChannels().stream().filter(c -> c.node().equals(node)).toList();
             if(network.channelCount(node)>=maxWorlds || local.stream().anyMatch(c -> c.occupied()+c.reserved()==0)){
                 creating.set(false);return CompletableFuture.completedFuture(false);
             }

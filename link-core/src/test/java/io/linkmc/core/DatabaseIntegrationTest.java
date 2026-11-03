@@ -19,11 +19,175 @@ class DatabaseIntegrationTest {
         Assumptions.assumeTrue(url!=null,"Set LINK_TEST_JDBC_URL for PostgreSQL integration tests");
         db=new Database(() -> DriverManager.getConnection(url,System.getenv("LINK_TEST_DB_USER"),System.getenv("LINK_TEST_DB_PASSWORD")));
         db.migrate();
-        db.transaction(c -> {for(String table:"link_routes,link_arrivals,link_reservations,link_channels,link_nodes,link_transfers,link_sessions,link_outbox,link_events,link_state,link_operations,link_templates,link_warps".split(","))update(c,"DELETE FROM "+table);return null;});
+        db.transaction(c -> {for(String table:"link_teleport_requests,link_player_names,link_routes,link_arrivals,link_reservations,link_channels,link_nodes,link_transfers,link_sessions,link_outbox,link_events,link_state,link_operations,link_templates,link_warps".split(","))update(c,"DELETE FROM "+table);return null;});
         events=new EventStore(db);sessions=new SessionStore(db,30);network=new NetworkStore(db);
     }
     private Transaction change(Session s,UUID op,long expected,String value) {
         return new Transaction(op,List.of(s),List.of(new Change("player:"+s.player(),expected,1,"test:set",value.getBytes(java.nio.charset.StandardCharsets.UTF_8))));
+    }
+    private void age(UUID operation)throws Exception{
+        db.transaction(c->{update(c,"UPDATE link_operations SET created_at=? WHERE id=?",java.sql.Timestamp.from(java.time.Instant.now().minus(java.time.Duration.ofDays(3))),operation);return null;});
+    }
+    @Test void retentionPreservesStateIdempotencyAndPendingNotifications()throws Exception{
+        Session owner=sessions.acquire(UUID.randomUUID(),"a");String key="player:"+owner.player();
+        Transaction first=change(owner,UUID.randomUUID(),0,"first");events.commit(first);age(first.operation());
+        Transaction second=change(owner,UUID.randomUUID(),1,"second");events.commit(second);age(second.operation());
+        Transaction latest=change(owner,UUID.randomUUID(),2,"latest");events.commit(latest);
+        db.transaction(c->{update(c,"UPDATE link_outbox SET delivered=true WHERE id=?",first.operation());update(c,"UPDATE link_outbox SET delivered=true WHERE id=?",latest.operation());return null;});
+        var retention=new EventRetention(db);var result=retention.prune(24,1);
+        assertEquals(1,result.operations());assertEquals(1,result.events());assertEquals(1,result.notifications());
+        assertTrue(events.commit(first).duplicate());assertEquals(3,events.read(key).orElseThrow().version());
+        assertThrows(ConflictException.class,()->events.commit(change(owner,first.operation(),0,"different")));
+        assertEquals(1,retention.prune(24,100).events());assertEquals(0,retention.prune(24,100).events());
+        assertEquals(List.of(3L),events.history(key,0,100).stream().map(e->e.state().version()).toList());
+        assertTrue(events.replay(key,2).isEmpty());assertArrayEquals("latest".getBytes(),events.replay(key,3).orElseThrow().payload());
+        int notifications=db.transaction(c->{try(var s=sql(c,"SELECT count(*) FROM link_outbox");var r=s.executeQuery()){r.next();return r.getInt(1);}});
+        assertEquals(2,notifications);
+        var restored=new FrameCommitter(tx->{throw new AssertionError("Unchanged recovered state must not write");});
+        restored.restore(events.read(key).orElseThrow());restored.commit(List.of(owner),Map.of(key,"latest".getBytes()),()->{});
+    }
+    @Test void retentionKeepsWholeTransactionWhenAnyAggregateStillUsesIt()throws Exception{
+        var original=new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",0,1,"test",new byte[]{1}),new Change("b",0,1,"test",new byte[]{2})));
+        events.commit(original);age(original.operation());
+        events.commit(new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",1,1,"test",new byte[]{3}))));
+        assertEquals(0,new EventRetention(db).prune(24,100).events());
+        assertEquals(2,events.history("a",0,100).size());assertEquals(1,events.history("b",0,100).size());
+    }
+    @Test void concurrentRetentionWorkersDeleteEachOldOperationOnce()throws Exception{
+        for(int i=0;i<7;i++){
+            UUID operation=UUID.randomUUID();events.commit(new Transaction(operation,List.of(),List.of(new Change("a",i,1,"test",new byte[]{(byte)i}))));
+            if(i<6)age(operation);
+        }
+        try(var executor=Executors.newFixedThreadPool(2)){
+            var a=executor.submit(()->new EventRetention(db).prune(24,100));var b=executor.submit(()->new EventRetention(db).prune(24,100));
+            assertEquals(6,a.get().events()+b.get().events());
+        }
+        assertEquals(1,events.history("a",0,100).size());assertEquals(7,events.read("a").orElseThrow().version());
+    }
+    @Test void retentionFailureRollsBackDeletedEvents()throws Exception{
+        UUID old=UUID.randomUUID();events.commit(new Transaction(old,List.of(),List.of(new Change("a",0,1,"test",new byte[]{1}))));age(old);
+        events.commit(new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",1,1,"test",new byte[]{2}))));
+        db.transaction(c->{update(c,"ALTER TABLE link_operations ADD CONSTRAINT test_retention_reject CHECK (NOT events_pruned)");return null;});
+        try{assertThrows(Exception.class,()->new EventRetention(db).prune(24,100));assertEquals(2,events.history("a",0,100).size());}
+        finally{db.transaction(c->{update(c,"ALTER TABLE link_operations DROP CONSTRAINT test_retention_reject");return null;});}
+    }
+    @Test void warpLifecycleIsSharedAndEventSourced()throws Exception{
+        var first=new Destination("a","shop-world",1.5,65,2.5,90,10);
+        var second=new Destination("b","mall",3,70,4,-45,20);
+        network.setWarp("shop",first);var otherBackend=new NetworkStore(db);
+        assertEquals(first,otherBackend.warp("shop").orElseThrow());assertEquals(List.of("shop"),otherBackend.warps());
+        otherBackend.setWarp("shop",second);assertEquals(second,network.warp("shop").orElseThrow());
+        assertTrue(network.deleteWarp("shop"));assertFalse(otherBackend.deleteWarp("shop"));assertTrue(otherBackend.warps().isEmpty());
+        assertEquals(List.of("warp:set","warp:set","warp:delete"),events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).stream().map(Event::type).toList());
+        assertEquals(3,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());assertEquals(0,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().payload().length);
+    }
+    @Test void maximumLengthWarpNameHasBoundedJournalIdentity()throws Exception{
+        String name="w".repeat(160);var destination=new Destination("a","shop",0,65,0,0,0);
+        network.setWarp(name,destination);assertEquals(destination,network.warp(name).orElseThrow());
+        String key=io.linkmc.api.LinkApi.warpStateId(name);assertTrue(key.length()<=160);
+        assertEquals(1,events.read(key).orElseThrow().version());assertTrue(network.deleteWarp(name));assertEquals(2,events.read(key).orElseThrow().version());
+    }
+    @Test void warpOnlyWorldNeverReceivesDefaultSpawnAdmissions()throws Exception{
+        network.heartbeat("a",10);var destination=new Destination("a","shop",5,65,6,90,0);
+        network.setWarp("shop",destination,2);
+        assertThrows(ConflictException.class,()->network.reserve(UUID.randomUUID(),UUID.randomUUID()));
+        assertEquals(0,network.channelCount("a"));assertTrue(network.spawnChannels().isEmpty());
+        var reserved=network.reserve(UUID.randomUUID(),UUID.randomUUID(),destination);assertEquals(destination,reserved.destination());
+        assertThrows(ConflictException.class,()->network.closeWorld("a","shop"));
+        network.cancel(reserved.id(),reserved.player());network.closeWorld("a","shop");
+        assertThrows(ConflictException.class,()->network.reserve(UUID.randomUUID(),UUID.randomUUID(),destination));
+        network.openWarpWorld("a","shop");assertEquals(1,network.channels().size());
+        network.syncWarpWorlds("a",List.of());assertTrue(network.channels().isEmpty());
+        network.syncWarpWorlds("a",List.of("shop"));assertEquals(1,network.channels().size());
+        network.register("a:shop",destination,2);assertTrue(network.spawnChannels().isEmpty());
+    }
+    @Test void warpChannelProjectionAndEventRollbackTogether()throws Exception{
+        network.heartbeat("a",10);
+        db.transaction(c->{update(c,"ALTER TABLE link_outbox ADD CONSTRAINT test_warp_reject CHECK (false)");return null;});
+        try{
+            assertThrows(Exception.class,()->network.setWarp("shop",new Destination("a","shop",0,65,0,0,0),2));
+            assertTrue(network.warp("shop").isEmpty());assertTrue(events.read(io.linkmc.api.LinkApi.warpStateId("shop")).isEmpty());assertTrue(network.channels().isEmpty());
+        }finally{db.transaction(c->{update(c,"ALTER TABLE link_outbox DROP CONSTRAINT test_warp_reject");return null;});}
+        var destination=new Destination("a","shop",0,65,0,0,0);network.setWarp("shop",destination,2);
+        db.transaction(c->{update(c,"DELETE FROM link_outbox");update(c,"ALTER TABLE link_outbox ADD CONSTRAINT test_warp_reject CHECK (false)");return null;});
+        try{
+            assertThrows(Exception.class,()->network.deleteWarp("shop"));
+            assertEquals(destination,network.warp("shop").orElseThrow());assertEquals(1,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());
+        }finally{db.transaction(c->{update(c,"ALTER TABLE link_outbox DROP CONSTRAINT test_warp_reject");return null;});}
+    }
+    @Test void concurrentWarpUpdatesHaveOrderedVersions()throws Exception{
+        try(var executor=Executors.newFixedThreadPool(4)){
+            List<Future<?>> tasks=new ArrayList<>();for(int i=0;i<8;i++){int x=i;tasks.add(executor.submit(()->{network.setWarp("shop",new Destination("a","shop",x,65,0,0,0));return null;}));}
+            for(var task:tasks)task.get();
+        }
+        assertEquals(8,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());assertEquals(8,events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).size());
+        try(var service=new LinkService(db)){
+            var tx=new Transaction(UUID.randomUUID(),List.of(),List.of(new Change(io.linkmc.api.LinkApi.warpStateId("shop"),8,1,"bad",new byte[]{1})));
+            assertThrows(ExecutionException.class,()->service.data().commit(tx).toCompletableFuture().get());
+        }
+    }
+    private Session tpPlayer(String name,String node)throws Exception{
+        network.heartbeat(node,20);Session owner=sessions.acquire(UUID.randomUUID(),node);new TeleportStore(db).registerPlayer(owner.player(),name);return owner;
+    }
+    @Test void teleportRequiresConsentAndRoutesRequesterToRecipient()throws Exception{
+        var a=tpPlayer("Alice","a");var b=tpPlayer("Bob","b");var store=new TeleportStore(db);
+        var request=store.request(a.player(),"bOB",false);
+        assertEquals("PENDING",request.state());assertTrue(new RouteStore(db).pending("a").isEmpty());assertEquals(1,store.incoming(b.player()).size());
+        assertThrows(TeleportStore.Rejected.class,()->store.resolve(request.id(),new Destination("b","lobby",1,65,2,90,0)));
+        assertThrows(TeleportStore.Rejected.class,()->store.request(a.player(),"Bob",false));
+        assertThrows(TeleportStore.Rejected.class,()->store.respond(a.player(),"Alice",true));
+        assertEquals("ACCEPTED",store.respond(b.player(),null,true).state());
+        var work=store.work("b").getFirst();var destination=new Destination("b","lobby",1,65,2,90,0);
+        try(var service=new LinkService(db)){
+            service.submitTeleport(work,destination,10).toCompletableFuture().get(5,TimeUnit.SECONDS);
+            service.submitTeleport(work,destination,10).toCompletableFuture().get(5,TimeUnit.SECONDS);
+        }
+        var route=new RouteStore(db).pending("a").getFirst();assertEquals(request.id(),route.id());assertEquals(a.player(),route.reservation().player());assertEquals(destination,route.reservation().destination());
+        assertEquals("DISPATCHED",store.notices("a").getFirst().state());assertTrue(store.work("b").isEmpty());
+        assertEquals(4,events.history("tpa:"+a.player(),0,10).size());
+        var saved=com.google.gson.JsonParser.parseString(new String(events.read("tpa:"+a.player()).orElseThrow().payload(),java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
+        assertEquals("b",saved.getAsJsonObject("destination").get("node").getAsString());assertEquals(a.epoch(),saved.get("requesterEpoch").getAsLong());
+    }
+    @Test void teleportHereMovesRecipientToRequesterAndRejectsSelfOffline()throws Exception{
+        var a=tpPlayer("Alice","a");var b=tpPlayer("Bob","b");var store=new TeleportStore(db);
+        assertThrows(TeleportStore.Rejected.class,()->store.request(a.player(),"Alice",false));assertThrows(TeleportStore.Rejected.class,()->store.request(a.player(),"Missing",false));
+        var request=store.request(a.player(),"Bob",true);store.respond(b.player(),"Alice",true);
+        var destination=new Destination("a","home",8,70,9,0,0);
+        try(var service=new LinkService(db)){service.submitTeleport(store.work("a").getFirst(),destination,10).toCompletableFuture().get(5,TimeUnit.SECONDS);}
+        var route=new RouteStore(db).pending("b").getFirst();assertEquals(request.id(),route.id());assertEquals(b.player(),route.reservation().player());assertEquals(destination,route.reservation().destination());
+    }
+    @Test void teleportDenyCancelExpiryAndReconnectNeverAuthorizeTravel()throws Exception{
+        var a=tpPlayer("Alice","a");var b=tpPlayer("Bob","b");var c=tpPlayer("Carol","a");var store=new TeleportStore(db);
+        store.request(a.player(),"Bob",false);assertEquals("DECLINED",store.respond(b.player(),"Alice",false).state());
+        store.request(c.player(),"Bob",false);assertTrue(store.cancel(c.player()));assertFalse(store.cancel(c.player()));
+        var d=tpPlayer("Dave","a");var expired=store.request(d.player(),"Bob",false);
+        db.transaction(sql->{update(sql,"UPDATE link_teleport_requests SET expires_at=clock_timestamp()-interval '1 second' WHERE id=?",expired.id());return null;});
+        assertThrows(TeleportStore.Rejected.class,()->store.respond(b.player(),"Dave",true));
+        var e=tpPlayer("Eve","a");store.request(e.player(),"Bob",false);sessions.release(e);sessions.acquire(e.player(),"a");
+        assertThrows(TeleportStore.Rejected.class,()->store.respond(b.player(),"Eve",true));assertTrue(new RouteStore(db).pending("a").isEmpty());
+    }
+    @Test void multipleTeleportRequestsRequireExplicitRequesterAndOneAcceptanceWins()throws Exception{
+        var a=tpPlayer("Alice","a");var b=tpPlayer("Bob","b");var c=tpPlayer("Carol","a");var store=new TeleportStore(db);
+        store.request(a.player(),"Bob",false);store.request(c.player(),"Bob",true);
+        assertThrows(TeleportStore.Rejected.class,()->store.respond(b.player(),null,true));
+        try(var pool=Executors.newFixedThreadPool(2)){
+            var tasks=new ArrayList<Future<Boolean>>();for(int i=0;i<2;i++)tasks.add(pool.submit(()->{try{store.respond(b.player(),"Alice",true);return true;}catch(TeleportStore.Rejected rejected){return false;}}));
+            int winners=0;for(var task:tasks)if(task.get())winners++;assertEquals(1,winners);
+        }
+        assertEquals("Carol",store.incoming(b.player()).getFirst().requesterName());
+    }
+    @Test void teleportRequestAndJournalRollbackTogether()throws Exception{
+        var a=tpPlayer("Alice","a");var b=tpPlayer("Bob","b");var store=new TeleportStore(db);
+        db.transaction(c->{update(c,"ALTER TABLE link_outbox ADD CONSTRAINT test_tpa_reject CHECK (false)");return null;});
+        try{assertThrows(Exception.class,()->store.request(a.player(),"Bob",false));assertTrue(store.incoming(b.player()).isEmpty());assertTrue(events.read("tpa:"+a.player()).isEmpty());}
+        finally{db.transaction(c->{update(c,"ALTER TABLE link_outbox DROP CONSTRAINT test_tpa_reject");return null;});}
+    }
+    @Test void teleportDirectoryIsSharedAndOldRequestsArePruned()throws Exception{
+        var a=tpPlayer("Alice","a");var b=tpPlayer("Bob","b");var store=new TeleportStore(db);
+        assertEquals(List.of("Alice","Bob"),new TeleportStore(db).onlinePlayers());var request=store.request(a.player(),"Bob",false);
+        db.transaction(c->{update(c,"UPDATE link_teleport_requests SET expires_at=? WHERE id=?",java.sql.Timestamp.from(java.time.Instant.now().minus(java.time.Duration.ofDays(3))),request.id());return null;});
+        assertEquals(1,new EventRetention(db).prune(24,100).requests());assertTrue(store.incoming(b.player()).isEmpty());
+        sessions.release(b);assertEquals(List.of("Alice"),store.onlinePlayers());assertTrue(events.read("tpa:"+a.player()).isPresent());
     }
     @Test void duplicateDoesNotCreateSecondEvent() throws Exception {
         Session s=sessions.acquire(UUID.randomUUID(),"a");
@@ -232,6 +396,42 @@ class DatabaseIntegrationTest {
         assertThrows(ConflictException.class,()->network.register("one",new Destination("b","spawn",0,65,0,0,0),2));
         UUID player=UUID.randomUUID(),request=UUID.randomUUID();network.reserve(player,request,spawn);
         assertThrows(ConflictException.class,()->network.reserve(player,request,new Destination("a","spawn",99,65,0,0,0)));
+    }
+    @Test void spawnPrefersCurrentBackendAndFallsBackWhenFull()throws Exception{
+        network.heartbeat("a",4);network.heartbeat("b",4);
+        network.register("remote",new Destination("a","spawn",0,65,0,0,0),4);
+        var local=new Destination("b","spawn",8,65,8,90,0);
+        network.register("local",local,1);
+        network.reserve(UUID.randomUUID(),UUID.randomUUID(),new Destination("a","spawn",0,65,0,0,0));
+        UUID player=UUID.randomUUID();sessions.acquire(player,"b");
+        var first=network.reserve(player,UUID.randomUUID());assertEquals(local,first.destination());
+        network.cancel(first.id(),player);
+        network.reserve(UUID.randomUUID(),UUID.randomUUID(),local);
+        assertEquals("a",network.reserve(player,UUID.randomUUID()).destination().node());
+    }
+    @Test void submittedTravelWakesBackendAfterDurableRequest()throws Exception{
+        network.heartbeat("a",2);network.register("one",new Destination("a","spawn",0,65,0,0,0),2);
+        UUID player=UUID.randomUUID(),operation=UUID.randomUUID();sessions.acquire(player,"a");
+        var observed=new java.util.concurrent.atomic.AtomicReference<RouteStore.Request>();
+        try(var service=new LinkService(db,request->{
+            try{assertEquals("REQUESTED",new RouteStore(db).status(request.id()));}
+            catch(Exception e){throw new AssertionError(e);}
+            observed.set(request);
+        })){
+            var reservation=service.network().requestTravel(player,operation,null).toCompletableFuture().get(5,TimeUnit.SECONDS);
+            assertEquals(new RouteStore.Request(operation,reservation),observed.get());
+            var routes=new RouteStore(db);routes.finish(operation,true);
+            routes.ready(operation);assertEquals("COMPLETE",routes.status(operation));
+            assertTrue(routes.readyFor(List.of(player)).isEmpty());assertFalse(routes.dispatch(operation));
+        }
+    }
+    @Test void failedWakeupRetainsDurableRouteForPolling()throws Exception{
+        network.heartbeat("a",2);network.register("one",new Destination("a","spawn",0,65,0,0,0),2);
+        UUID player=UUID.randomUUID(),operation=UUID.randomUUID();sessions.acquire(player,"a");
+        try(var service=new LinkService(db,request->{throw new IllegalStateException("scheduler unavailable");})){
+            service.network().requestTravel(player,operation,null).toCompletableFuture().get(5,TimeUnit.SECONDS);
+            assertEquals(operation,new RouteStore(db).pending("a").getFirst().id());
+        }
     }
     @Test void routeDispatchHasOneWinnerAndCompletionIsTerminal()throws Exception{
         network.heartbeat("a",2);network.register("one",new Destination("a","spawn",0,65,0,0,0),2);

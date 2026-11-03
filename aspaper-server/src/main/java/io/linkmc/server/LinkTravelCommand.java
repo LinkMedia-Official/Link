@@ -22,7 +22,7 @@ final class LinkTravelCommand extends Command {
 
     LinkTravelCommand(String name, LinkApi.Network network, boolean journal,
                       Consumer<Runnable> dispatch, Consumer<Throwable> logError) {
-        super(name, "Link travel", name.equals("warp") ? "/warp <name>" : "/spawn", List.of());
+        super(name, "Link 이동", name.equals("warp") ? "/warp <이름> | /워프 <이름>" : "/spawn | /스폰", List.of(name.equals("warp")?"워프":"스폰"));
         this.network = network;
         this.journal = journal;
         this.dispatch = dispatch;

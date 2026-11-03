@@ -12,6 +12,8 @@ public final class LinkConfiguration {
     private final String mode, node, jdbcUrl, username, password, redisUri, template;
     private final int templateVersion, worldCapacity, nodeCapacity, maxWorlds;
     private final String storage,endpoint,region,bucket,prefix,accessKey,secretKey;
+    private final boolean retentionEnabled;
+    private final int retentionHours,retentionInterval,retentionBatch,retentionBatches;
     public static synchronized LinkConfiguration get(){
         if(instance==null)instance=load(Path.of("link.yml"),System.getenv(),System.getProperties());
         return instance;
@@ -20,7 +22,9 @@ public final class LinkConfiguration {
         try{
             try{Files.writeString(file,DEFAULTS,StandardOpenOption.CREATE_NEW);}catch(FileAlreadyExistsException ignored){}
             var yaml=new YamlConfiguration();yaml.load(file.toFile());
-            return new LinkConfiguration(yaml,environment,properties);
+            var config=new LinkConfiguration(yaml,environment,properties);
+            if(!yaml.contains("retention"))Files.writeString(file,"\n"+RETENTION_DEFAULTS,StandardOpenOption.APPEND);
+            return config;
         }catch(IOException|org.bukkit.configuration.InvalidConfigurationException e){
             // Parser errors may quote the line containing a password.
             throw new IllegalStateException("Cannot read link.yml; check YAML syntax and file permissions");
@@ -49,6 +53,13 @@ public final class LinkConfiguration {
         prefix=string(yaml,"storage.slimevault.prefix","link");
         accessKey=env.getOrDefault("LINK_S3_ACCESS_KEY",string(yaml,"storage.slimevault.access-key",""));
         secretKey=env.getOrDefault("LINK_S3_SECRET_KEY",string(yaml,"storage.slimevault.secret-key",""));
+        Object retention=yaml.get("retention.enabled",true);
+        if(!(retention instanceof Boolean))throw new IllegalArgumentException("retention.enabled must be true or false");
+        retentionEnabled=(Boolean)retention;
+        retentionHours=bounded(yaml,"retention.event-hours",24,1,87600);
+        retentionInterval=bounded(yaml,"retention.interval-seconds",60,10,86400);
+        retentionBatch=bounded(yaml,"retention.batch-operations",500,1,1000);
+        retentionBatches=bounded(yaml,"retention.max-batches",10,1,100);
         io.linkmc.api.LinkApi.requireName(node);io.linkmc.api.LinkApi.requireName(template);
         if(mode.equals("journal")||mode.equals("tools")){
             if((!jdbcUrl.startsWith("jdbc:postgresql:")&&!jdbcUrl.startsWith("jdbc:mariadb:"))||username.isBlank()||password.isBlank())
@@ -65,6 +76,16 @@ public final class LinkConfiguration {
         throw new IllegalArgumentException(key+" must be a positive integer in link.yml or -D"+property);
     }
     public String mode(){return mode;}
+    private static int bounded(YamlConfiguration yaml,String key,int fallback,int minimum,int maximum){
+        Object value=yaml.get(key,fallback);
+        if(value instanceof Integer number&&number>=minimum&&number<=maximum)return number;
+        throw new IllegalArgumentException(key+" must be an integer between "+minimum+" and "+maximum);
+    }
+    public boolean retentionEnabled(){return retentionEnabled;}
+    public int retentionHours(){return retentionHours;}
+    public int retentionInterval(){return retentionInterval;}
+    public int retentionBatch(){return retentionBatch;}
+    public int retentionBatches(){return retentionBatches;}
     public String node(){return node;}
     public String jdbcUrl(){return jdbcUrl;}
     public String username(){return username;}
@@ -78,6 +99,16 @@ public final class LinkConfiguration {
     public io.linkmc.core.WorldBlobs.Store worldStorage(){
         return storage.equals("database")?null:new io.linkmc.core.SlimeVaultStore(endpoint,region,bucket,prefix,accessKey,secretKey);
     }
+    private static final String RETENTION_DEFAULTS="""
+        # Deletes old event history, retaining current state and latest transaction anchors.
+        # Older historical rollback is unavailable after pruning. Restart after editing.
+        retention:
+          enabled: true
+          event-hours: 24
+          interval-seconds: 60
+          batch-operations: 500
+          max-batches: 10
+        """;
     private static final String DEFAULTS="""
         # Link backend configuration. Restart the server after editing.
         # Environment variables override database/node/Redis values.
@@ -109,5 +140,5 @@ public final class LinkConfiguration {
           version: 1
           capacity: 50
           max-worlds: 3
-        """;
+        """+RETENTION_DEFAULTS;
 }

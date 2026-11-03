@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS link_events (
 CREATE TABLE IF NOT EXISTS link_outbox (
  id uuid PRIMARY KEY REFERENCES link_operations(id), delivered boolean NOT NULL DEFAULT false
 );
+ALTER TABLE link_operations ADD COLUMN IF NOT EXISTS events_pruned boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS link_operations_retention_idx ON link_operations(events_pruned,created_at,id);
+CREATE INDEX IF NOT EXISTS link_events_operation_idx ON link_events(operation);
+CREATE INDEX IF NOT EXISTS link_outbox_delivery_idx ON link_outbox(delivered,id);
 CREATE TABLE IF NOT EXISTS link_transfers (
  id uuid PRIMARY KEY, player uuid NOT NULL REFERENCES link_sessions(player), source_node text NOT NULL,
  source_epoch bigint NOT NULL, destination_node text NOT NULL, world text NOT NULL,
@@ -43,6 +47,7 @@ CREATE TABLE IF NOT EXISTS link_channels (
  x double precision NOT NULL, y double precision NOT NULL, z double precision NOT NULL,
  yaw real NOT NULL, pitch real NOT NULL, UNIQUE(node,world)
 );
+ALTER TABLE link_channels ADD COLUMN IF NOT EXISTS spawn_enabled boolean NOT NULL DEFAULT true;
 CREATE TABLE IF NOT EXISTS link_reservations (
  id uuid PRIMARY KEY, player uuid NOT NULL, channel text NOT NULL REFERENCES link_channels(id),
  state text NOT NULL CHECK(state IN ('RESERVED','ADMITTED')), expires_at timestamptz NOT NULL
@@ -81,3 +86,17 @@ CREATE TABLE IF NOT EXISTS link_routes (
 CREATE UNIQUE INDEX IF NOT EXISTS link_one_route_request ON link_routes(player) WHERE state='REQUESTED';
 ALTER TABLE link_routes DROP CONSTRAINT IF EXISTS link_routes_state_check;
 ALTER TABLE link_routes ADD CONSTRAINT link_routes_state_check CHECK(state IN ('REQUESTED','READY','CONNECTING','COMPLETE','FAILED'));
+
+CREATE TABLE IF NOT EXISTS link_player_names (player uuid PRIMARY KEY, name text NOT NULL, lower_name text NOT NULL);
+CREATE INDEX IF NOT EXISTS link_player_names_lookup_idx ON link_player_names(lower_name);
+CREATE TABLE IF NOT EXISTS link_teleport_requests (
+ id uuid PRIMARY KEY, requester uuid NOT NULL, recipient uuid NOT NULL,
+ requester_epoch bigint NOT NULL, recipient_epoch bigint NOT NULL,
+ here boolean NOT NULL, state text NOT NULL,
+ expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ destination_node text, destination_world text,
+ x double precision, y double precision, z double precision, yaw real, pitch real
+);
+CREATE INDEX IF NOT EXISTS link_tp_requester_idx ON link_teleport_requests(requester,created_at);
+CREATE INDEX IF NOT EXISTS link_tp_recipient_idx ON link_teleport_requests(recipient,expires_at);
+CREATE INDEX IF NOT EXISTS link_tp_expiry_idx ON link_teleport_requests(expires_at);

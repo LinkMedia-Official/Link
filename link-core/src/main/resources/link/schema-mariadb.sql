@@ -23,6 +23,10 @@ CREATE TABLE IF NOT EXISTS link_events (
 CREATE TABLE IF NOT EXISTS link_outbox (
  id uuid PRIMARY KEY REFERENCES link_operations(id), delivered boolean NOT NULL DEFAULT false
 ) ENGINE=InnoDB;
+ALTER TABLE link_operations ADD COLUMN IF NOT EXISTS events_pruned boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS link_operations_retention_idx ON link_operations(events_pruned,created_at,id);
+CREATE INDEX IF NOT EXISTS link_events_operation_idx ON link_events(operation);
+CREATE INDEX IF NOT EXISTS link_outbox_delivery_idx ON link_outbox(delivered,id);
 CREATE TABLE IF NOT EXISTS link_transfers (
  id uuid PRIMARY KEY, player uuid NOT NULL REFERENCES link_sessions(player), source_node varchar(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
  source_epoch bigint NOT NULL, destination_node varchar(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, world varchar(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -45,6 +49,7 @@ CREATE TABLE IF NOT EXISTS link_channels (
  x double precision NOT NULL, y double precision NOT NULL, z double precision NOT NULL,
  yaw real NOT NULL, pitch real NOT NULL, UNIQUE(node,world)
 ) ENGINE=InnoDB;
+ALTER TABLE link_channels ADD COLUMN IF NOT EXISTS spawn_enabled boolean NOT NULL DEFAULT true;
 CREATE TABLE IF NOT EXISTS link_reservations (
  id uuid PRIMARY KEY, player uuid NOT NULL, channel varchar(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL REFERENCES link_channels(id),
  state varchar(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL CHECK(state IN ('RESERVED','ADMITTED')), expires_at datetime(6) NOT NULL, x double precision, y double precision, z double precision, yaw real, pitch real
@@ -87,3 +92,17 @@ ALTER TABLE link_routes ADD COLUMN IF NOT EXISTS link_one_route_request_key UUID
 CREATE UNIQUE INDEX IF NOT EXISTS link_one_route_request ON link_routes(link_one_route_request_key);
 
 
+
+CREATE TABLE IF NOT EXISTS link_player_names (player uuid PRIMARY KEY, name varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, lower_name varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL) ENGINE=InnoDB;
+CREATE INDEX IF NOT EXISTS link_player_names_lookup_idx ON link_player_names(lower_name);
+CREATE TABLE IF NOT EXISTS link_teleport_requests (
+ id uuid PRIMARY KEY, requester uuid NOT NULL, recipient uuid NOT NULL,
+ requester_epoch bigint NOT NULL, recipient_epoch bigint NOT NULL,
+ here boolean NOT NULL, state varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ expires_at datetime(6) NOT NULL, created_at datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+ destination_node varchar(512) CHARACTER SET ascii COLLATE ascii_bin, destination_world varchar(512) CHARACTER SET ascii COLLATE ascii_bin,
+ x double precision, y double precision, z double precision, yaw real, pitch real
+) ENGINE=InnoDB;
+CREATE INDEX IF NOT EXISTS link_tp_requester_idx ON link_teleport_requests(requester,created_at);
+CREATE INDEX IF NOT EXISTS link_tp_recipient_idx ON link_teleport_requests(recipient,expires_at);
+CREATE INDEX IF NOT EXISTS link_tp_expiry_idx ON link_teleport_requests(expires_at);

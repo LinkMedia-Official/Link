@@ -15,7 +15,7 @@ class LinkCompletionsTestSuite {
     }
     @Test void subcommandsFilterByPrefix(){
         assertEquals(List.of("save"),catalog().admin(new String[]{"sa"}));
-        assertEquals(9,catalog().admin(new String[]{""}).size());
+        assertEquals(20,catalog().admin(new String[]{""}).size());
     }
     @Test void worldSuggestionsDistinguishLoadedAndStored(){
         assertEquals(List.of("editor","link-spawn"),catalog().admin(new String[]{"save",""}));
@@ -50,5 +50,14 @@ class LinkCompletionsTestSuite {
         when(sender.hasPermission("link.admin")).thenReturn(true);
         assertEquals(List.of("save"),command.tabComplete(sender,"link:link",new String[]{"sa"}));
         verifyNoInteractions(api);
+    }
+    @Test void koreanAndNestedTemplateSuggestions(){
+        assertEquals(List.of("저장"),catalog().admin(new String[]{"저"}));
+        assertEquals(List.of("editor","link-spawn"),catalog().admin(new String[]{"저장",""}));
+        assertEquals(List.of("영구"),catalog().admin(new String[]{"생성","world","lobby","1","영"}));
+        assertEquals(List.of("1","3"),catalog().template(new String[]{"편집","lobby",""}));
+        assertEquals(List.of("4"),catalog().admin(new String[]{"템플릿","저장후나가기","lobby",""}));
+        assertEquals(List.of("editor","link-spawn","saved"),catalog().template(new String[]{"입장",""}));
+        assertTrue(catalog().template(new String[]{"나가기",""}).isEmpty());
     }
 }

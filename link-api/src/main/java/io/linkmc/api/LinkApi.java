@@ -16,9 +16,30 @@ public interface LinkApi {
     Data data();
     Sessions sessions();
     Network network();
+    default Teleports teleports(){throw new IllegalStateException("No teleport request service");}
+    interface Teleports {
+        CompletionStage<TeleportRequest> request(UUID requester,String recipient,boolean here);
+        /** Null requester name selects the only pending request; multiple requests require a name. */
+        CompletionStage<TeleportRequest> respond(UUID recipient,String requester,boolean accept);
+        CompletionStage<Boolean> cancel(UUID requester);
+        CompletionStage<List<TeleportRequest>> incoming(UUID recipient);
+        CompletionStage<List<String>> onlinePlayers();
+    }
+    record TeleportRequest(UUID id,UUID requester,String requesterName,UUID recipient,String recipientName,boolean here,String state,Instant expiresAt){}
     /** Available on a Link backend; proxies only expose data/session/network services. */
     default Worlds worlds() { throw new IllegalStateException("No world engine on this node"); }
     default Engine engine() { throw new IllegalStateException("No native engine on this node"); }
+    default Editors editors() { throw new IllegalStateException("No template editor on this node"); }
+
+    /** Backend-only editing excursions. Implementations retain the original return position. */
+    interface Editors {
+        CompletionStage<WorldInfo> create(UUID player, String workspace);
+        CompletionStage<WorldInfo> edit(UUID player, String template, int version);
+        CompletionStage<Void> enter(UUID player, String workspace);
+        CompletionStage<Void> save(UUID player, String template, int version, boolean exit);
+        /** Saves the working world and returns; does not publish a template version. */
+        CompletionStage<Void> exit(UUID player);
+    }
 
     interface Engine {
         boolean journalEnabled();
@@ -47,6 +68,7 @@ public interface LinkApi {
     interface Data {
         CompletionStage<Optional<State>> read(String id);
         CompletionStage<Commit> commit(Transaction transaction);
+        /** Retention may prune historical revisions. Results remain ordered but may contain gaps; read() returns current state. */
         CompletionStage<List<Event>> history(String id, long afterVersion, int limit);
     }
 
@@ -69,6 +91,10 @@ public interface LinkApi {
         CompletionStage<Void> cancel(UUID reservation, UUID player);
         CompletionStage<Optional<Destination>> warp(String name);
         CompletionStage<Void> setWarp(String name, Destination destination);
+        /** Registers a loaded destination world for warp travel without making it a public spawn. */
+        CompletionStage<Void> setWarp(String name, Destination destination, int capacity);
+        CompletionStage<Boolean> deleteWarp(String name);
+        CompletionStage<List<String>> warps();
         /** Enqueues native source checkpoint and proxy travel; null destination allocates a spawn. */
         CompletionStage<Reservation> requestTravel(UUID player, UUID operation, Destination destination);
         /** REQUESTED, READY, CONNECTING, COMPLETE, FAILED or MISSING. */
@@ -127,6 +153,12 @@ public interface LinkApi {
     record Channel(String id, String node, String world, int capacity, int occupied, int reserved) {}
     record Reservation(UUID id, UUID player, String channel, Destination destination, Instant expiresAt) {}
 
+    /** Stable bounded event aggregate identifier, including for 160-character warp names. */
+    static String warpStateId(String name){
+        requireName(name);
+        try{return "warp:"+java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(name.getBytes(java.nio.charset.StandardCharsets.UTF_8)));}
+        catch(java.security.NoSuchAlgorithmException error){throw new AssertionError(error);}
+    }
     static void requireName(String value) {
         if (value == null || !value.matches("[A-Za-z0-9_./:-]{1,160}") || value.contains(".."))
             throw new IllegalArgumentException("Invalid Link identifier");

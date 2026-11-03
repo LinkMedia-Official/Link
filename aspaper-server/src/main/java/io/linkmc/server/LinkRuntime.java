@@ -13,14 +13,17 @@ public final class LinkRuntime implements LinkApi {
     private static volatile LinkRuntime instance;
     private final LinkService service;
     private final WorldService worlds;
+    private final LinkEditors editors;
     private final LinkWorldDriver driver;
     private final SessionStore leases;
     private final Database database;
     private final String node;
     private final NetworkStore networkStore;
     private RedisOutbox redis;
+    private LinkTeleportRuntime teleportRuntime;
     private volatile boolean closing;
     private final ScheduledExecutorService notifications=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Link-Notifications").factory());
+    private final ScheduledExecutorService maintenance=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Link-Retention").factory());
     private SpawnProvisioner provisioner;
     private boolean templateEditor;
     private String bootstrapWorld="link-spawn";
@@ -30,9 +33,10 @@ public final class LinkRuntime implements LinkApi {
         this.database=db;this.node=node;networkStore=new NetworkStore(db);
         leases=new SessionStore(db,30);
         nodeLease=NativeJournal.enabled()?NativeJournal.startupOwner():leases.acquire(UUID.nameUUIDFromBytes(("link-node:"+node).getBytes(StandardCharsets.UTF_8)),node);
-        service=new LinkService(db);
-        driver=new LinkWorldDriver(new EventStore(db),nodeLease,node,db.worldBlobs());
+        service=new LinkService(db,NativeJournal::submitRoute);
+        driver=new LinkWorldDriver(new EventStore(db),nodeLease,node,db.worldBlobs(),networkStore);
         worlds=new WorldService(driver,new TemplateStore(db));
+        editors=new LinkEditors(worlds);
     }
     /** Called from PaperWorldLoader before any default dimension is constructed. */
     public static void beforeWorlds(){
@@ -93,6 +97,7 @@ public final class LinkRuntime implements LinkApi {
                 NativeJournal.activate();
                 runtime.networkStore.heartbeat(runtime.node,config.nodeCapacity());
                 runtime.networkStore.reconcileNode(runtime.nodeLease);
+                runtime.networkStore.syncWarpWorlds(runtime.node,runtime.driver.loadedNames());
                 for(var world:org.bukkit.Bukkit.getWorlds())if(runtime.templateEditor?world.getName().equals(runtime.bootstrapWorld):(world.getName().equals("link-spawn")||world.getName().startsWith("spawn-"))){
                     var pos=world.getSpawnLocation();
                     runtime.networkStore.register(runtime.node+":"+world.getName(),new Destination(runtime.node,world.getName(),pos.getX(),pos.getY(),pos.getZ(),pos.getYaw(),pos.getPitch()),config.worldCapacity());
@@ -108,6 +113,15 @@ public final class LinkRuntime implements LinkApi {
             },0,2,TimeUnit.SECONDS);
             LinkCommand.register(runtime,completions);
             LinkTravelCommand.register(runtime,completions);
+            LinkWarpCommand.register(runtime.network(),runtime.node,config.worldCapacity(),completions);
+            if(NativeJournal.enabled()){
+                runtime.teleportRuntime=new LinkTeleportRuntime(runtime.database,runtime.service,runtime.node,config.worldCapacity());
+                LinkTeleportCommand.register(runtime.teleports(),runtime.teleportRuntime);runtime.teleportRuntime.start();
+            }
+            if(config.retentionEnabled()){
+                net.minecraft.server.MinecraftServer.LOGGER.info("Link event retention enabled: {} hours; latest state/transaction anchors retained",config.retentionHours());
+                runtime.maintenance.scheduleWithFixedDelay(()->runtime.pruneEvents(config),config.retentionInterval(),config.retentionInterval(),TimeUnit.SECONDS);
+            }
         }catch(Exception e){throw new IllegalStateException("Link world activation failed",e);}
     }
     public static void stop(){LinkRuntime runtime=instance;if(runtime!=null){instance=null;RuntimeProvider.uninstall(runtime);runtime.close();}}
@@ -120,8 +134,20 @@ public final class LinkRuntime implements LinkApi {
         }catch(Exception e){net.minecraft.server.MinecraftServer.LOGGER.warn("Redis delivery deferred; SQL outbox retained",e);}
     }
     private synchronized void closeNotifications(){if(redis!=null){redis.close();redis=null;}}
+    private void pruneEvents(LinkConfiguration config){
+        int events=0,operations=0,notifications=0,requests=0;
+        try{
+            var retention=new EventRetention(database);
+            for(int i=0;i<config.retentionBatches()&&!closing&&!Thread.currentThread().isInterrupted();i++){
+                var result=retention.prune(config.retentionHours(),config.retentionBatch());
+                events+=result.events();operations+=result.operations();notifications+=result.notifications();requests+=result.requests();
+                if(result.operations()<config.retentionBatch()&&result.notifications()<config.retentionBatch()&&result.requests()<config.retentionBatch())break;
+            }
+            if(events>0||notifications>0||requests>0)net.minecraft.server.MinecraftServer.LOGGER.info("Link retention: pruned {} events from {} historical operations, {} delivered notifications and {} expired requests",events,operations,notifications,requests);
+        }catch(Exception error){net.minecraft.server.MinecraftServer.LOGGER.warn("Link retention deferred; current state preserved",error);}
+    }
     private void close(){
-        closing=true;notifications.shutdownNow();
+        closing=true;notifications.shutdownNow();maintenance.shutdownNow();if(teleportRuntime!=null)teleportRuntime.close();
         worlds.close();
         try {if(NativeJournal.enabled())NativeJournal.shutdown();else driver.saveOnShutdown();}
         catch(Exception e){net.minecraft.server.MinecraftServer.LOGGER.error("Link final checkpoint failed; ownership will not be explicitly released",e);}
@@ -130,7 +156,9 @@ public final class LinkRuntime implements LinkApi {
     public Data data(){return service.data();}
     public Sessions sessions(){return service.sessions();}
     public Network network(){return service.network();}
+    public Teleports teleports(){return service.teleports();}
     public Worlds worlds(){return worlds;}
+    public Editors editors(){return editors;}
     public Engine engine(){return new Engine(){
         public boolean journalEnabled(){return NativeJournal.enabled();}
         public CompletionStage<Void> transact(Runnable mutation){

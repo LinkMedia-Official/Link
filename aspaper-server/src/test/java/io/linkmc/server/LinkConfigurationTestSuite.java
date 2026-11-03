@@ -47,4 +47,15 @@ class LinkConfigurationTestSuite {
         assertTrue(config.jdbcUrl().startsWith("jdbc:mariadb:"));assertNotNull(config.worldStorage());
         assertFalse(Files.readString(file()).contains("test-secret"));
     }
+    @Test void retentionDefaultsAreAppendedToExistingYamlWithoutOverwriting()throws Exception{
+        Files.writeString(file(),"# preserved\nmode: disabled\n");var config=load();
+        assertTrue(config.retentionEnabled());assertEquals(24,config.retentionHours());assertEquals(60,config.retentionInterval());assertEquals(500,config.retentionBatch());assertEquals(10,config.retentionBatches());
+        String text=Files.readString(file());assertTrue(text.startsWith("# preserved"));assertTrue(text.contains("retention:"));load();assertEquals(text,Files.readString(file()));
+    }
+    @Test void retentionCanBeDisabledAndRejectsDangerousLimits()throws Exception{
+        Files.writeString(file(),"retention:\n  enabled: false\n  event-hours: 72\n");assertFalse(load().retentionEnabled());assertEquals(72,load().retentionHours());
+        for(String setting:List.of("enabled: nope","event-hours: 0","batch-operations: 1001","interval-seconds: 0","max-batches: 101")){
+            Files.writeString(file(),"retention:\n  "+setting+"\n");assertThrows(IllegalArgumentException.class,this::load);
+        }
+    }
 }

@@ -192,7 +192,13 @@ public final class NativeJournal {
         return snapshot(name).orElse(template);
     }
     static void createdWorld(String name,boolean persistent){
-        if(enabled()&&instance.catalog.putIfAbsent(name,(byte)(persistent?1:0))!=null)throw new ConflictException("World identity already exists; choose a new name");
+        if(enabled()){
+            Byte previous=instance.catalog.putIfAbsent(name,(byte)(persistent?1:0));
+            if(previous!=null)throw ConflictException.worldExists(name,previous==2);
+        }
+    }
+    static void requireNewWorld(String name){
+        if(knownWorld(name))throw ConflictException.worldExists(name,Objects.equals(instance.catalog.get(name),(byte)2));
     }
     static boolean knownWorld(String name){return enabled()&&instance.catalog.containsKey(name);}
     static boolean persistentWorld(String name){return enabled()&&Objects.equals(instance.catalog.get(name),(byte)1);}
@@ -233,6 +239,8 @@ public final class NativeJournal {
     public static void joined(ServerPlayer player){
         if(!enabled())return;
         var j=instance;j.players.put(player.getUUID(),player);
+        try{new TeleportStore(j.db).registerPlayer(player.getUUID(),player.getBukkitEntity().getName());}
+        catch(Exception error){throw new IllegalStateException("Player directory registration failed",error);}
         CompoundTag tag=j.playerData.get(player.getUUID());if(tag!=null)NativePlayerCodec.recover(player,tag);
     }
     public static void left(ServerPlayer player){if(enabled())instance.departing.add(player.getUUID());}
@@ -262,11 +270,17 @@ public final class NativeJournal {
                 j.admitted.replace(entry.getKey(),old,new ArrivalStore.Arrival(old.ticket(),renewed,old.destination()));
             }catch(ConflictException stale){if(j.admitted.get(entry.getKey())==old&&!j.moving.contains(entry.getKey()))throw stale;}
         }
-        for(var route:new RouteStore(j.db).pending(j.node))if(j.queuedRoutes.add(route.id())){
+        for(var route:new RouteStore(j.db).pending(j.node))submitRoute(route);
+    }
+    static void submitRoute(RouteStore.Request route){
+        NativeJournal j=instance;
+        if(j==null||j.poisoned||!j.queuedRoutes.add(route.id()))return;
+        try{
             MinecraftServer.getServer().execute(()->{
-                try{j.transfer(route);}finally{j.queuedRoutes.remove(route.id());}
+                try{if(!j.poisoned)run(()->j.transfer(route));}
+                finally{j.queuedRoutes.remove(route.id());}
             });
-        }
+        }catch(RuntimeException error){j.queuedRoutes.remove(route.id());throw error;}
     }
     private void transfer(RouteStore.Request route){
         UUID id=route.reservation().player();
@@ -274,6 +288,12 @@ public final class NativeJournal {
         ServerPlayer player=players.get(id);if(player==null)return;
         try{
             if(!new RouteStore(db).status(route.id()).equals("REQUESTED"))return;
+            if(player.getBukkitEntity().getPersistentDataContainer().has(LinkEditors.KEY,org.bukkit.persistence.PersistentDataType.STRING)){
+                new RouteStore(db).finish(route.id(),false);
+                new NetworkStore(db).cancel(route.reservation().id(),id);
+                player.getBukkitEntity().sendMessage("템플릿 편집 중에는 /템플릿 나가기로 복귀한 뒤 이동하세요.");
+                return;
+            }
             player.closeContainer();player.stopRiding();
             // Release all source gameplay changes before freezing its ownership.
             checkpoint();LinkPacketGate.begin();
@@ -290,7 +310,10 @@ public final class NativeJournal {
             }
             // The proxy must not observe READY until the local destination/world
             // removal frame has committed as well as the final source inventory.
-            completions.add(()->{try{new RouteStore(db).ready(route.id());}catch(Exception e){throw new IllegalStateException("Route acknowledgement failed",e);}});
+            completions.add(()->{try{
+                if(local)new RouteStore(db).finish(route.id(),true);
+                else new RouteStore(db).ready(route.id());
+            }catch(Exception e){throw new IllegalStateException("Route acknowledgement failed",e);}});
         }catch(Exception e){throw new IllegalStateException("Transfer preparation failed",e);}
     }
     static void shutdown(){
