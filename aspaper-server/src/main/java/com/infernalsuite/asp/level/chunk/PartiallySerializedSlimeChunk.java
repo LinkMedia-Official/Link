@@ -65,6 +65,10 @@ public record PartiallySerializedSlimeChunk(
             // Sky light Nibble Array
             NibbleArray skyLightArray = Converter.convertArray(lightEngine.getLayerListener(LightLayer.SKY).getDataLayerData(SectionPos.of(chunk.getPos(), chunk.getSectionYFromSectionIndex(sectionId))));
 
+            // Async serializers must not observe lighting changes after capture.
+            if (blockLightArray != null) blockLightArray = blockLightArray.clone();
+            if (skyLightArray != null) skyLightArray = skyLightArray.clone();
+
             sections[sectionId] = new PartiallySerializedSlimeChunkSection(section.copy(), blockLightArray, skyLightArray);
         }
         List<SavedTick<Block>> blockTicks = null;

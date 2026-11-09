@@ -12,6 +12,10 @@ import java.io.*;
 final class NativePlayerCodec {
     private NativePlayerCodec(){}
     static byte[] encode(ServerPlayer player)throws Exception{
+        return compress(capture(player));
+    }
+    /** Only called on the server thread; returned NBT owns all mutable arrays. */
+    static CompoundTag capture(ServerPlayer player)throws Exception{
         try(var reporter=new ProblemReporter.ScopedCollector(player.problemPath(),net.minecraft.server.MinecraftServer.LOGGER)){
             TagValueOutput output=TagValueOutput.createWithContext(reporter,player.registryAccess());
             player.saveWithoutId(output);
@@ -41,8 +45,11 @@ final class NativePlayerCodec {
                 TagValueOutput item=TagValueOutput.createWithContext(reporter,player.registryAccess());item.store("item",ItemStack.OPTIONAL_CODEC,slot.getItem());recovery.add(item.buildResult());
             }
             tag.put("LinkRecovery",recovery);
-            var bytes=new ByteArrayOutputStream();NbtIo.writeCompressed(tag,bytes);return bytes.toByteArray();
+            return tag.copy();
         }
+    }
+    static byte[] compress(CompoundTag tag)throws IOException{
+        var bytes=new ByteArrayOutputStream();NbtIo.writeCompressed(tag,bytes);return bytes.toByteArray();
     }
     static CompoundTag decode(byte[] bytes)throws IOException{return NbtIo.readCompressed(new ByteArrayInputStream(bytes),NbtAccounter.create(32L*1024*1024));}
     static void recover(ServerPlayer player,CompoundTag tag){

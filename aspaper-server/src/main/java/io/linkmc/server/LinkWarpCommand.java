@@ -69,7 +69,7 @@ final class LinkWarpCommand extends Command {
     }
     @Override public List<String> tabComplete(CommandSender sender,String alias,String[] args){
         if(!journal||!testPermissionSilent(sender)||args.length!=1)return List.of();
-        if(getName().equals("warps"))return "1".startsWith(args[0])?List.of("1"):List.of();
-        return completions.warps(args[0]);
+        if(getName().equals("warps"))return completions.warpPages(args[0]);
+        return getName().equals("setwarp")?completions.fixedWarps(args[0]):completions.warps(args[0]);
     }
 }

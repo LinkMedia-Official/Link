@@ -21,6 +21,7 @@ public final class LinkRuntime implements LinkApi {
     private final NetworkStore networkStore;
     private RedisOutbox redis;
     private LinkTeleportRuntime teleportRuntime;
+    private LinkGroupRuntime groupRuntime;
     private volatile boolean closing;
     private final ScheduledExecutorService notifications=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Link-Notifications").factory());
     private final ScheduledExecutorService maintenance=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Link-Retention").factory());
@@ -32,7 +33,8 @@ public final class LinkRuntime implements LinkApi {
     private LinkRuntime(Database db,String node)throws Exception {
         this.database=db;this.node=node;networkStore=new NetworkStore(db);
         leases=new SessionStore(db,30);
-        nodeLease=NativeJournal.enabled()?NativeJournal.startupOwner():leases.acquire(UUID.nameUUIDFromBytes(("link-node:"+node).getBytes(StandardCharsets.UTF_8)),node);
+        nodeLease=NativeJournal.enabled()?NativeJournal.startupOwner():leases.acquireNode(node);
+        db.nodeOwner(()->nodeLease);
         service=new LinkService(db,NativeJournal::submitRoute);
         driver=new LinkWorldDriver(new EventStore(db),nodeLease,node,db.worldBlobs(),networkStore);
         worlds=new WorldService(driver,new TemplateStore(db));
@@ -70,14 +72,15 @@ public final class LinkRuntime implements LinkApi {
                 runtime.heartbeat.scheduleWithFixedDelay(() -> {
                     try {
                         runtime.nodeLease=runtime.leases.renew(runtime.nodeLease);NativeJournal.renew();
+                        if(runtime.closing)return;
                         if(NativeJournal.enabled()){
-                            runtime.networkStore.heartbeat(node,config.nodeCapacity());
-                            if(runtime.provisioner!=null)runtime.provisioner.ensureSpare(0,65,0,0,0).whenComplete((created,error)->{if(error!=null)net.minecraft.server.MinecraftServer.LOGGER.error("Link spawn provisioning failed",error);});
+                            try{runtime.networkStore.heartbeat(node,config.nodeCapacity());}catch(Exception networkError){net.minecraft.server.MinecraftServer.LOGGER.warn("Link network heartbeat deferred; node lease renewed",networkError);}
+                            if(runtime.provisioner!=null)runtime.provisioner.ensureSpare().whenComplete((created,error)->{if(error!=null)net.minecraft.server.MinecraftServer.LOGGER.error("Link spawn provisioning failed",error);});
                         }
                     }
                     catch(Exception e){
-                        net.minecraft.server.MinecraftServer.LOGGER.error("Link lost its DB lease; stopping to fence this backend",e);
-                        org.bukkit.Bukkit.shutdown();
+                        net.minecraft.server.MinecraftServer.LOGGER.error("Link could not maintain ownership after bounded retries; stopping this backend",e);
+                        NativeJournal.fenceOwnership();try{runtime.fenceWorkers();}finally{org.bukkit.Bukkit.shutdown();}
                     }
                 },5,5,TimeUnit.SECONDS);
                 NativeJournal.finishStartup();
@@ -99,22 +102,26 @@ public final class LinkRuntime implements LinkApi {
                 runtime.networkStore.reconcileNode(runtime.nodeLease);
                 runtime.networkStore.syncWarpWorlds(runtime.node,runtime.driver.loadedNames());
                 for(var world:org.bukkit.Bukkit.getWorlds())if(runtime.templateEditor?world.getName().equals(runtime.bootstrapWorld):(world.getName().equals("link-spawn")||world.getName().startsWith("spawn-"))){
-                    var pos=world.getSpawnLocation();
+                    var pos=LinkTemplateGui.spawn(world);
                     runtime.networkStore.register(runtime.node+":"+world.getName(),new Destination(runtime.node,world.getName(),pos.getX(),pos.getY(),pos.getZ(),pos.getYaw(),pos.getPitch()),config.worldCapacity());
                 }
                 if(!runtime.templateEditor)runtime.provisioner=new SpawnProvisioner(runtime.worlds,runtime.networkStore,runtime.node,config.template(),config.templateVersion(),config.worldCapacity(),config.maxWorlds());
             }
             String redisUri=config.redisUri();
             if(redisUri!=null&&!redisUri.isBlank())runtime.notifications.scheduleWithFixedDelay(()->runtime.deliverNotifications(redisUri),0,5,TimeUnit.SECONDS);
-            var completions=new LinkCompletions(runtime.driver::loadedNames,config.template());
+            var completions=new LinkCompletions(runtime.driver::loadedNames,runtime.driver::editableNames,config.template());
             runtime.notifications.scheduleWithFixedDelay(()->{
                 try{completions.refresh(runtime.database,runtime.node);}
                 catch(Exception error){net.minecraft.server.MinecraftServer.LOGGER.debug("Link completion catalog refresh failed",error);}
             },0,2,TimeUnit.SECONDS);
+            LinkTemplateGui.register();LinkWorldProtection.register();
+            LinkUtilityCommand.register(runtime.utilities());
             LinkCommand.register(runtime,completions);
             LinkTravelCommand.register(runtime,completions);
+            org.bukkit.Bukkit.getCommandMap().register("link",new LinkWarpGroupCommand(runtime,completions,runtime.node));
             LinkWarpCommand.register(runtime.network(),runtime.node,config.worldCapacity(),completions);
             if(NativeJournal.enabled()){
+                runtime.groupRuntime=new LinkGroupRuntime(runtime.database,runtime.worlds,runtime.node,()->runtime.nodeLease);runtime.groupRuntime.start();
                 runtime.teleportRuntime=new LinkTeleportRuntime(runtime.database,runtime.service,runtime.node,config.worldCapacity());
                 LinkTeleportCommand.register(runtime.teleports(),runtime.teleportRuntime);runtime.teleportRuntime.start();
             }
@@ -124,7 +131,10 @@ public final class LinkRuntime implements LinkApi {
             }
         }catch(Exception e){throw new IllegalStateException("Link world activation failed",e);}
     }
-    public static void stop(){LinkRuntime runtime=instance;if(runtime!=null){instance=null;RuntimeProvider.uninstall(runtime);runtime.close();}}
+    public static synchronized void stop(){LinkRuntime runtime=instance;if(runtime!=null){runtime.closing=true;RuntimeProvider.uninstall(runtime);try{runtime.close();}finally{instance=null;}}}
+    static boolean isClosing(){var runtime=instance;var server=net.minecraft.server.MinecraftServer.getServer();return runtime==null||runtime.closing||(server!=null&&server.hasStopped());}
+    public static void beginShutdown(){var runtime=instance;if(runtime!=null)try{runtime.fenceWorkers();}catch(Exception error){net.minecraft.server.MinecraftServer.LOGGER.warn("Link shutdown worker drain failed",error);}}
+    private void fenceWorkers(){closing=true;try{if(teleportRuntime!=null)teleportRuntime.close();}finally{if(groupRuntime!=null)groupRuntime.close();}}
     static void fence(){LinkRuntime runtime=instance;if(runtime!=null)runtime.heartbeat.shutdownNow();}
     private synchronized void deliverNotifications(String uri){
         if(closing)return;
@@ -147,11 +157,31 @@ public final class LinkRuntime implements LinkApi {
         }catch(Exception error){net.minecraft.server.MinecraftServer.LOGGER.warn("Link retention deferred; current state preserved",error);}
     }
     private void close(){
-        closing=true;notifications.shutdownNow();maintenance.shutdownNow();if(teleportRuntime!=null)teleportRuntime.close();
-        worlds.close();
-        try {if(NativeJournal.enabled())NativeJournal.shutdown();else driver.saveOnShutdown();}
-        catch(Exception e){net.minecraft.server.MinecraftServer.LOGGER.error("Link final checkpoint failed; ownership will not be explicitly released",e);}
-        finally {heartbeat.shutdownNow();closeNotifications();service.close();database.close();}
+        closing=true;
+        boolean saved=false;
+        try {
+            if(teleportRuntime!=null)teleportRuntime.close();
+            if(groupRuntime!=null)groupRuntime.close();
+            notifications.shutdownNow();maintenance.shutdownNow();
+            worlds.close();
+            if(NativeJournal.enabled())NativeJournal.shutdown();else driver.saveOnShutdown();
+            saved=true;
+        }
+        catch(Exception e){
+            NativeJournal.fenceOwnership();
+            if(NativeJournal.enabled())try{NativeJournal.shutdown();}catch(Exception cleanup){e.addSuppressed(cleanup);}
+            net.minecraft.server.MinecraftServer.LOGGER.error("Link final checkpoint failed; ownership will not be explicitly released",e);
+        }
+        finally {
+            heartbeat.shutdownNow();
+            notifications.shutdownNow();maintenance.shutdownNow();
+            try{
+                if(!heartbeat.awaitTermination(15,TimeUnit.SECONDS))saved=false;
+                service.close();
+                if(saved)leases.releaseNode(nodeLease);
+            }catch(Exception e){net.minecraft.server.MinecraftServer.LOGGER.warn("Link ownership cleanup deferred or already fenced",e);}
+            finally {closeNotifications();database.close();}
+        }
     }
     public Data data(){return service.data();}
     public Sessions sessions(){return service.sessions();}
@@ -159,6 +189,8 @@ public final class LinkRuntime implements LinkApi {
     public Teleports teleports(){return service.teleports();}
     public Worlds worlds(){return worlds;}
     public Editors editors(){return editors;}
+    public WarpGroups warpGroups(){return service.warpGroups();}
+    public Utilities utilities(){return new LinkUtilities();}
     public Engine engine(){return new Engine(){
         public boolean journalEnabled(){return NativeJournal.enabled();}
         public CompletionStage<Void> transact(Runnable mutation){

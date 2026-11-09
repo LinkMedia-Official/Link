@@ -8,6 +8,21 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class FrameCommitterTest {
+    @Test void readsAndUnrelatedRestoreDoNotWaitForDatabaseCommit()throws Exception{
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        var journal=new FrameCommitter(tx->{entered.countDown();assertTrue(release.await(5,java.util.concurrent.TimeUnit.SECONDS));return new Commit(tx.operation(),false);});
+        journal.restore(new State("a",1,1,new byte[]{1}));
+        try(var pool=java.util.concurrent.Executors.newFixedThreadPool(2)){
+            var committing=pool.submit(()->{journal.commit(List.of(),Map.of("a",new byte[]{2}),()->{});return null;});
+            try{
+                assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS));
+                var reading=pool.submit(()->{journal.restore(new State("b",1,1,new byte[]{3}));return journal.state("a").orElseThrow().version();});
+                assertEquals(1L,reading.get(1,java.util.concurrent.TimeUnit.SECONDS));
+            }finally{release.countDown();}
+            committing.get(5,java.util.concurrent.TimeUnit.SECONDS);assertEquals(2,journal.state("a").orElseThrow().version());
+            journal.restore(new State("a",1,1,new byte[]{0}));assertEquals(2,journal.state("a").orElseThrow().version());
+        }
+    }
     @Test void playerAndBlockAndEntityPublishOnlyAfterOneCommit()throws Exception{
         List<String> sequence=new ArrayList<>();
         FrameCommitter journal=new FrameCommitter(tx->{assertEquals(3,tx.changes().size());sequence.add("db");return new Commit(tx.operation(),false);});

@@ -33,7 +33,7 @@ dependencies {
 
 반환값은 `CompletionStage`입니다. Minecraft 메인 스레드에서 `join()`이나 `get()`으로 기다리지 마세요. 의존 작업은 `thenCompose`로 연결하고, 완료 콜백이 메인 스레드라고 가정하지 마세요. 콜백에서 Bukkit/NMS 상태를 바꿔야 한다면 `engine().transact`로 다시 전달합니다.
 
-`data().history()`는 [이벤트 보관 정책](storage-retention.md)의 영향을 받습니다. 기본 24시간이 지난 과거 이벤트는 정리될 수 있고 최신 상태를 보존하는 트랜잭션만 예외로 남습니다. 반환 버전이 연속이거나 최초 버전부터 존재한다고 가정하지 마세요. 현재 상태와 작업 UUID 중복 방지 기록은 보존합니다.
+`data().history()`는 deprecated 읽기 전용 호환 API입니다. 이전 버전에서 저장한 이벤트만 반환하고 새 커밋은 이력을 만들지 않습니다. 기존 이력은 [보관 정책](storage-retention.md)에 따라 모두 만료될 수 있습니다. 현재 상태는 `data().read()`로 조회합니다. 트랜잭션·예상 버전·작업 UUID 중복 방지 계약은 유지됩니다.
 
 다음은 백엔드 플러그인 메서드 내부에서 사용하는 예제입니다.
 
@@ -59,7 +59,7 @@ link.worlds().createEditor("lobby-editor")
 
 ## 이동과 워프
 
-`network().warps()`는 공용 DB의 워프 이름 목록을, `deleteWarp(name)`은 삭제 여부를 반환합니다. `setWarp(name, destination)`은 위치만 등록하고 기존 입장 채널을 사용합니다. `setWarp(name, destination, capacity)`는 필요하면 워프 전용 입장 채널을 같은 SQL 트랜잭션에 추가합니다. 호출자는 해당 노드와 월드가 실제로 로드됐는지 확인해야 합니다. 워프 전용 채널은 스폰 자동 배정에 포함되지 않습니다. 설정·삭제는 같은 이름별로 직렬화하며 `LinkApi.warpStateId(name)` 이벤트와 DB 조회용 상태를 원자적으로 변경합니다. 일반 `data().commit()`으로 `warp:` 예약 영역을 수정할 수 없습니다. 삭제는 이후 조회에 적용되며 삭제 전에 목적지를 조회한 이동 요청이나 이미 발급된 예약은 자동 취소하지 않습니다.
+`network().warps()`는 공용 DB의 워프 이름 목록을, `deleteWarp(name)`은 삭제 여부를 반환합니다. `setWarp(name, destination)`은 위치만 등록하고 기존 입장 채널을 사용합니다. `setWarp(name, destination, capacity)`는 필요하면 워프 전용 입장 채널을 같은 SQL 트랜잭션에 추가합니다. 호출자는 해당 노드와 월드가 실제로 로드됐는지 확인해야 합니다. 워프 전용 채널은 스폰 자동 배정에 포함되지 않습니다. 설정·삭제는 같은 이름별로 직렬화하며 `LinkApi.warpStateId(name)` 최신 상태와 DB 조회용 상태를 원자적으로 변경합니다. 일반 `data().commit()`으로 `warp:` 예약 영역을 수정할 수 없습니다. 삭제는 이후 조회에 적용되며 삭제 전에 목적지를 조회한 이동 요청이나 이미 발급된 예약은 자동 취소하지 않습니다.
 
 편집 입장은 `link.editors().create(playerId, "lobby-work")` 또는 `edit(playerId, "lobby", 1)`로 요청합니다. `save(playerId, "lobby", 2, true)`는 작업 저장·발행 후 복귀하고, 마지막 인수가 `false`면 편집을 계속합니다. `exit(playerId)`는 작업 월드만 저장하고 복귀합니다. `enter(playerId, workspace)`는 저장된 작업을 재개합니다. 이 API가 서버 스레드 이동과 편집 세션을 관리하므로 별도 텔레포트가 필요하지 않습니다. API 자체는 권한 검사를 하지 않으므로 호출 플러그인이 권한을 확인해야 합니다. 작업 월드는 영구 보관되며 명시적으로 정리해야 합니다. 편집 세션이 있으면 Link 이동 요청은 `FAILED`로 끝나므로 먼저 `exit`를 완료하세요.
 
@@ -102,11 +102,11 @@ io.linkmc.api.Link.api().engine().transact(() -> {
 });
 ```
 
-완료는 포함된 프레임의 커밋을 뜻합니다. 콜백 내부에서 예외가 발생하면 Java 객체를 원복하지 않고 백엔드를 중단합니다. 외부 HTTP·파일·다른 DB의 부수 효과는 포함하지 않습니다. 범용 롤백 가능한 DB 트랜잭션처럼 임의의 작업을 넣지 마세요.
+완료는 해당 변경을 포함한 비동기 체크포인트의 DB 커밋을 뜻합니다. 일반 게임 패킷은 이 완료를 기다리지 않으며, 기본 30초 자동 저장 사이의 강제 종료에는 미저장 변경 유실이 가능합니다. 콜백 내부에서 예외가 발생하면 Java 객체를 원복하지 않고 백엔드를 중단합니다. 외부 HTTP·파일·다른 DB의 부수 효과는 포함하지 않습니다. 범용 롤백 가능한 DB 트랜잭션처럼 임의의 작업을 넣지 마세요.
 
 ## 플러그인 데이터
 
-플러그인 자체 데이터는 `data().read/commit/history`로 다룹니다. 트랜잭션에는 작업 UUID, 소유권 가드, 상태별 예상 버전과 변경 후 바이트를 전달합니다. 예상 버전 `0`은 신규 상태입니다. 재시도는 같은 UUID와 동일한 내용을 사용해야 합니다.
+플러그인 자체 데이터는 `data().read/commit`으로 다룹니다. 트랜잭션에는 작업 UUID, 소유권 가드, 상태별 예상 버전과 변경 후 바이트를 전달합니다. 예상 버전 `0`은 신규 상태입니다. 재시도는 같은 UUID와 동일한 내용을 사용해야 합니다.
 
 `player:`와 `native:` 네임스페이스는 일반 데이터 API 쓰기가 거부됩니다. 네이티브 상태 변경은 엔진 API와 지원되는 Bukkit/NMS 경로를 사용하세요. 과거 이벤트의 인코딩 스키마를 읽을 수 있도록 플러그인 자체 코덱을 관리해야 합니다.
 
@@ -124,3 +124,22 @@ io.linkmc.api.Link.api().engine().transact(() -> {
 `TeleportRequest`의 ID는 이동 작업 UUID와 같습니다. `DISPATCHED`는 이동 제출을 의미하며 도착 완료는 `network().travelStatus(id)`로 확인하세요. 수락 이후 위치 확정·이동 제출은 목적지 버킷이 수행합니다. 요청 만료, 세션 epoch, 정원 검사가 적용됩니다. 명령 권한은 버킷 명령에서 검사하므로 API를 호출하는 플러그인은 호출자의 권한과 UUID를 직접 검증해야 합니다. 비동기 완료 콜백에서 Bukkit 객체를 직접 변경하지 마세요.
 
 `tpa:`는 내부 상태 영역이므로 일반 `data().commit` 쓰기를 거부합니다. 요청 변경은 반드시 `teleports()`를 사용하세요.
+
+`editors().openSettings(playerUUID)`는 현재 편집 작업의 설정 GUI를 엽니다. 접속 상태·편집 월드·`link.admin` 권한을 확인합니다. `worlds().spawn(worldName)`은 로드된 Link 월드의 템플릿 스폰을 `Destination`으로 비동기 조회하며 소수점 좌표·yaw·pitch를 보존합니다. 기본 메서드를 추가해 외부 구현체의 바이너리 호환성을 유지했으며, 이 기능을 구현하지 않은 외부 제공자는 `UnsupportedOperationException`을 던질 수 있습니다.
+
+## 플레이어 유틸리티 API
+
+`Link.api().utilities()`는 `speed(UUID, double level, MovementMode)`, `flight(UUID, Boolean enabled)`, `heal(UUID)`, `feed(UUID)`를 제공합니다. `MovementMode`는 `AUTO`, `WALK`, `FLY`이며 `flight`의 `null`은 비행 권한 토글입니다. 반환값은 `CompletionStage<Void>`로 네이티브 커밋 이후 완료됩니다. 호출하는 플러그인은 대상 UUID의 권한을 검증해야 합니다. 유효하지 않은 속도나 모드는 호출 시 거부될 수 있으므로 동기 인자 오류와 비동기 실행 오류를 모두 처리하세요. 서버 스레드에서 완료를 기다리며 `join()`하지 마세요.
+
+## 템플릿 채널 그룹
+
+`warpGroups()`는 `bind(name, template, version, homeNode)`, `list()`, `channels(name)`, `travel(playerUUID, operationUUID, name)`, `status(operationUUID)`를 제공합니다. `travel`은 고정 워프와 그룹 워프 모두 지원하며 완료 시점은 요청 접수/제출입니다. 실제 도착은 `status`가 `COMPLETE`인지 확인하세요. 그룹 생성 대기는 `WAITING`, 거부/만료는 `FAILED`, 이후에는 기존 라우트 상태를 반환합니다. 재시도에는 같은 작업 UUID를 사용하고 실패한 작업을 임의 새 UUID로 반복하지 마세요.
+
+`ChannelPolicy(capacity, maxChannels, autoExpand, networkWide)`는 발행 버전에 고정됩니다. 그룹 목록의 `WarpGroup.policy()`로 읽을 수 있습니다. `network().warp(name)`은 기존 고정 좌표 워프 조회용이며 그룹 목적지 선택에는 `warpGroups().travel`을 사용합니다. `worlds().ensurePersistent(name, template, version)`는 같은 영구 월드를 재사용/로드하거나 없을 때 생성하며, 그룹 작업의 재시작 복구에 사용합니다. 일반 플러그인은 그룹 내부 월드 ID를 직접 생성·삭제하지 마세요. `group-request:`와 `group-world:` 상태는 내부 예약 영역입니다.
+
+
+### 이동 요청 재시도
+
+network().requestTravel(player, operation, destination)는 같은 operation UUID의 재요청에 최초 예약을 반환합니다. 완료 후 또는 재접속 후 재요청해도 다시 이동하지 않습니다. 다른 플레이어나 다른 명시적 목적지로 UUID를 재사용하면 충돌입니다. 새로운 이동에는 새로운 UUID를 사용하세요. 반환되는 예약은 최초 제출 기록이며 완료 여부는 travelStatus(operation)으로 조회하세요.
+
+같은 서버 이동은 Bukkit 텔레포트 이벤트 취소를 존중하며 취소된 요청만 FAILED 처리합니다. 이동 완료는 목적지 플레이어 상태 저장 후 확정됩니다. link_route_receipts는 중복 실행 방지를 위한 작은 영수증이며 블록 변경 이벤트 로그가 아닙니다. 현재 자동 삭제하지 않으므로 UUID 재시도 보장을 유지하려면 수동으로 삭제하지 마세요.

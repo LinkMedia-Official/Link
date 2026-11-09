@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Link <link@localhost>
+Date: Tue, 3 Nov 2026 22:00:00 +0900
+Subject: [PATCH] Route explicit saves through ordered asynchronous storage
+
+diff --git a/net/minecraft/server/commands/SaveAllCommand.java b/net/minecraft/server/commands/SaveAllCommand.java
+index 2999919..99ccc39 100644
+--- a/net/minecraft/server/commands/SaveAllCommand.java
++++ b/net/minecraft/server/commands/SaveAllCommand.java
+@@ -23,6 +23,13 @@ public class SaveAllCommand {
+ 
+     private static int saveAll(final CommandSourceStack source, final boolean flush) throws CommandSyntaxException {
+         source.sendSuccess(() -> Component.translatable("commands.save.saving"), false);
++        if (io.linkmc.server.NativeJournal.enabled()) {
++            io.linkmc.server.NativeJournal.saveAsync().whenComplete((ignored, error) -> {
++                if (error == null) source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
++                else source.sendFailure(Component.translatable("commands.save.failed"));
++            });
++            return Command.SINGLE_SUCCESS;
++        }
+         MinecraftServer server = source.getServer();
+         boolean success = server.saveEverything(true, flush, true);
+         if (!success) {

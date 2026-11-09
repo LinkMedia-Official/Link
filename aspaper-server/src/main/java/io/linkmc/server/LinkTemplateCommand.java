@@ -7,7 +7,7 @@ import org.bukkit.command.*;
 import org.bukkit.entity.Player;
 
 final class LinkTemplateCommand extends Command {
-    static final String HELP="/템플릿 생성 <작업월드> | 편집 <이름> <버전> | 입장 <작업월드> | 저장 <이름> <새버전> | 나가기 | 저장후나가기 <이름> <새버전> | 목록";
+    static final String HELP="/템플릿 생성 <작업월드> | 편집 <이름> <버전> | 입장 <작업월드> | 저장 <이름> <새버전> | 나가기 | 저장후나가기 <이름> <새버전> | 설정 | 목록";
     private final LinkApi api;
     private final LinkCompletions completions;
     LinkTemplateCommand(LinkApi api,LinkCompletions completions){
@@ -15,7 +15,7 @@ final class LinkTemplateCommand extends Command {
         this.api=api;this.completions=completions;setPermission("link.admin");
     }
     static String action(String value){return switch(value.toLowerCase(Locale.ROOT)){
-        case "생성"->"new";case "편집"->"edit";case "입장"->"enter";case "저장"->"save";
+        case "설정","gui"->"settings";case "생성"->"new";case "편집"->"edit";case "입장"->"enter";case "저장"->"save";
         case "나가기"->"exit";case "저장후나가기"->"saveexit";case "목록"->"list";
         default->value.toLowerCase(Locale.ROOT);
     };}
@@ -28,6 +28,7 @@ final class LinkTemplateCommand extends Command {
                 count(args,1);LinkCommand.report(sender,api.worlds().templates(),"템플릿 목록");return true;
             }
             if(!(sender instanceof Player player)){sender.sendMessage("편집 명령어는 플레이어만 사용할 수 있습니다.");return true;}
+            if(action.equals("settings")){count(args,1);api.editors().openSettings(player.getUniqueId()).whenComplete((v,e)->{if(e!=null)LinkCommand.report(sender,java.util.concurrent.CompletableFuture.failedFuture(e),"");});return true;}
             CompletionStage<?> operation=switch(action){
                 case "new"->{count(args,2);yield api.editors().create(player.getUniqueId(),args[1]);}
                 case "edit"->{count(args,3);yield api.editors().edit(player.getUniqueId(),args[1],version(args[2]));}

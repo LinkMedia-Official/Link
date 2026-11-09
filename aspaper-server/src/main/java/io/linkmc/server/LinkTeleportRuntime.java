@@ -27,9 +27,10 @@ final class LinkTeleportRuntime implements AutoCloseable {
         return candidates.stream().filter(n->n.toLowerCase(Locale.ROOT).startsWith(prefix.toLowerCase(Locale.ROOT))).distinct().sorted().toList();
     }
     private void poll(){
-        if(closed)return;
+        if(closed||LinkRuntime.isClosing())return;
         try{
             online=store.onlinePlayers();notices=store.notices(node);var snapshot=notices;
+            if(closed||LinkRuntime.isClosing())return;
             net.minecraft.server.MinecraftServer.getServer().execute(()->notifyPlayers(snapshot));
             for(var task:store.work(node))if(busy.add(task.request().id()))net.minecraft.server.MinecraftServer.getServer().execute(()->resolve(task));
         }catch(Exception error){net.minecraft.server.MinecraftServer.LOGGER.warn("Teleport request polling deferred",error);}
@@ -54,7 +55,7 @@ final class LinkTeleportRuntime implements AutoCloseable {
         });
     }
     private void notifyPlayers(List<LinkApi.TeleportRequest> snapshot){
-        if(closed)return;
+        if(closed||LinkRuntime.isClosing())return;
         Set<UUID> current=new HashSet<>();
         for(var request:snapshot){
             current.add(request.id());
@@ -70,5 +71,9 @@ final class LinkTeleportRuntime implements AutoCloseable {
         }
         seen.keySet().retainAll(current);
     }
-    @Override public void close(){closed=true;worker.shutdownNow();}
+    @Override public void close(){
+        closed=true;worker.shutdownNow();
+        try{if(!worker.awaitTermination(15,TimeUnit.SECONDS))throw new IllegalStateException("Teleport scheduler did not stop");}
+        catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException("Interrupted while stopping teleport scheduler",e);}
+    }
 }

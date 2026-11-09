@@ -30,9 +30,35 @@ public interface LinkApi {
     default Worlds worlds() { throw new IllegalStateException("No world engine on this node"); }
     default Engine engine() { throw new IllegalStateException("No native engine on this node"); }
     default Editors editors() { throw new IllegalStateException("No template editor on this node"); }
+    default Utilities utilities() { throw new IllegalStateException("No player utilities on this node"); }
+    default WarpGroups warpGroups() { throw new IllegalStateException("No warp group service"); }
+    record ChannelPolicy(int capacity,int maxChannels,boolean autoExpand,boolean networkWide) {
+        public ChannelPolicy {if(capacity<1||capacity>1000||maxChannels<1||maxChannels>100)throw new IllegalArgumentException("Channel limits out of range");}
+        public static ChannelPolicy defaults(){return new ChannelPolicy(50,3,true,false);}
+    }
+    record WarpGroup(String name,String template,int version,String homeNode,ChannelPolicy policy){}
+    interface WarpGroups {
+        CompletionStage<Void> bind(String name,String template,int version,String homeNode);
+        CompletionStage<List<WarpGroup>> list();
+        CompletionStage<List<Channel>> channels(String name);
+        CompletionStage<String> status(UUID operation);
+        /** Queues a group warp or submits an existing fixed warp. The UUID is the travel operation. */
+        CompletionStage<Void> travel(UUID player,UUID operation,String name);
+    }
+    enum MovementMode { AUTO, WALK, FLY }
+    /** Backend-only; callers must authorize the target UUID. Completion follows the native commit. */
+    interface Utilities {
+        CompletionStage<Void> speed(UUID player, double level, MovementMode mode);
+        /** Null toggles flight; true enables flight immediately. */
+        CompletionStage<Void> flight(UUID player, Boolean enabled);
+        CompletionStage<Void> heal(UUID player);
+        CompletionStage<Void> feed(UUID player);
+    }
 
     /** Backend-only editing excursions. Implementations retain the original return position. */
     interface Editors {
+        /** Opens the backend settings GUI for the player's active template workspace. */
+        default CompletionStage<Void> openSettings(UUID player) { throw new UnsupportedOperationException(); }
         CompletionStage<WorldInfo> create(UUID player, String workspace);
         CompletionStage<WorldInfo> edit(UUID player, String template, int version);
         CompletionStage<Void> enter(UUID player, String workspace);
@@ -53,6 +79,9 @@ public interface LinkApi {
     }
 
     interface Worlds {
+        default CompletionStage<WorldInfo> ensurePersistent(String name,String template,int version){throw new UnsupportedOperationException();}
+        /** Resolves the loaded world's template spawn, including exact position and view. */
+        default CompletionStage<Destination> spawn(String name) { throw new UnsupportedOperationException(); }
         CompletionStage<List<String>> templates();
         CompletionStage<WorldInfo> createEditor(String name);
         CompletionStage<Void> publish(String editor, String template, int version);
@@ -69,6 +98,8 @@ public interface LinkApi {
         CompletionStage<Optional<State>> read(String id);
         CompletionStage<Commit> commit(Transaction transaction);
         /** Retention may prune historical revisions. Results remain ordered but may contain gaps; read() returns current state. */
+        /** Legacy read-only history; new commits only store current state. */
+        @Deprecated
         CompletionStage<List<Event>> history(String id, long afterVersion, int limit);
     }
 
@@ -139,7 +170,7 @@ public interface LinkApi {
         public Transaction {
             java.util.Objects.requireNonNull(operation);
             guards = List.copyOf(guards); changes = List.copyOf(changes);
-            if (changes.isEmpty() || changes.size() > 1024) throw new IllegalArgumentException("Invalid change count");
+            if (changes.isEmpty() || changes.size() > 65536) throw new IllegalArgumentException("Invalid change count");
             if (changes.stream().map(Change::id).distinct().count() != changes.size())
                 throw new IllegalArgumentException("Duplicate aggregate");
             if (guards.stream().map(Session::player).distinct().count() != guards.size())
@@ -147,7 +178,7 @@ public interface LinkApi {
         }
     }
     record Commit(UUID operation, boolean duplicate) {}
-    /** After-state events are replayed without invoking gameplay or plugin callbacks. */
+    /** Legacy after-state event, retained for API compatibility. */
     record Event(UUID operation, State state, String type, Instant createdAt) {}
     record Transfer(UUID id, UUID player, long finalVersion, Destination destination) {}
     record Channel(String id, String node, String world, int capacity, int occupied, int reserved) {}

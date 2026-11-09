@@ -106,3 +106,26 @@ CREATE TABLE IF NOT EXISTS link_teleport_requests (
 CREATE INDEX IF NOT EXISTS link_tp_requester_idx ON link_teleport_requests(requester,created_at);
 CREATE INDEX IF NOT EXISTS link_tp_recipient_idx ON link_teleport_requests(recipient,expires_at);
 CREATE INDEX IF NOT EXISTS link_tp_expiry_idx ON link_teleport_requests(expires_at);
+CREATE TABLE IF NOT EXISTS link_template_channels (
+ name varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, version integer NOT NULL, capacity integer NOT NULL, max_channels integer NOT NULL,
+ auto_expand boolean NOT NULL, network_wide boolean NOT NULL, PRIMARY KEY(name,version)
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS link_warp_groups (
+ name varchar(160) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY, template varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, version integer NOT NULL, home_node varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ capacity integer NOT NULL, max_channels integer NOT NULL, auto_expand boolean NOT NULL, network_wide boolean NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS link_group_worlds (
+ id varchar(160) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY, group_name varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, node varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, world varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ state varchar(32) NOT NULL, UNIQUE(node,world)
+) ENGINE=InnoDB;
+CREATE INDEX IF NOT EXISTS link_group_worlds_group_idx ON link_group_worlds(group_name,state);
+CREATE TABLE IF NOT EXISTS link_group_requests (
+ id uuid PRIMARY KEY, player uuid NOT NULL, group_name varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, node varchar(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, epoch bigint NOT NULL,
+ state varchar(32) NOT NULL, expires_at datetime(6) NOT NULL, created_at datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB;
+CREATE INDEX IF NOT EXISTS link_group_requests_node_idx ON link_group_requests(node,state);
+
+CREATE TABLE IF NOT EXISTS link_route_receipts (
+ id uuid PRIMARY KEY, player uuid NOT NULL, node varchar(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ epoch bigint NOT NULL, details longblob NOT NULL, claimed boolean NOT NULL DEFAULT false
+) ENGINE=InnoDB;

@@ -25,6 +25,11 @@ public class SlimeSerializer {
     private static final Logger LOGGER = LoggerFactory.getLogger(SlimeSerializer.class);
 
     public static byte[] serialize(SlimeWorld world) {
+        return serialize(world, null);
+    }
+
+    /** Assemble SRF with already captured chunk data (used by incremental native storage). */
+    public static byte[] serialize(SlimeWorld world, byte[] capturedChunks) {
         Map<String, BinaryTag> extraData = world.getExtraData();
         SlimePropertyMap propertyMap = world.getPropertyMap();
 
@@ -60,7 +65,10 @@ public class SlimeSerializer {
 
             // Chunks
 
-            writeCompressed(outStream, value -> serializeChunks(value, world, world.getChunkStorage(), additionalWorldData));
+            writeCompressed(outStream, value -> {
+                if (capturedChunks == null) serializeChunks(value, world, world.getChunkStorage(), additionalWorldData);
+                else value.write(capturedChunks);
+            });
 
             writeCompressed(outStream, value -> {
                 //Avoid a buffered output stream by casting to DataOutput. Buffered Output Streams make the memory usage explode
@@ -81,6 +89,21 @@ public class SlimeSerializer {
                 .filter(chunk -> !ChunkPruner.canBePruned(world, chunk))
                 .toList();
 
+        writeChunks(outStream, world, chunksToSave, data);
+    }
+
+    /** Lossless capture, including empty chunks with PDC, light, POI or scheduled ticks. */
+    public static byte[] captureChunks(SlimeWorld world, Collection<SlimeChunk> chunks) throws IOException {
+        var data = EnumSet.noneOf(v13AdditionalWorldData.class);
+        if (world.getPropertyMap().getValue(SlimeProperties.SAVE_POI)) data.add(v13AdditionalWorldData.POI_CHUNKS);
+        if (world.getPropertyMap().getValue(SlimeProperties.SAVE_BLOCK_TICKS)) data.add(v13AdditionalWorldData.BLOCK_TICKS);
+        if (world.getPropertyMap().getValue(SlimeProperties.SAVE_FLUID_TICKS)) data.add(v13AdditionalWorldData.FLUID_TICKS);
+        var bytes = new ByteArrayOutputStream();
+        writeChunks(new DataOutputStream(bytes), world, chunks, data);
+        return bytes.toByteArray();
+    }
+
+    private static void writeChunks(DataOutputStream outStream, SlimeWorld world, Collection<SlimeChunk> chunksToSave, EnumSet<v13AdditionalWorldData> data) throws IOException {
         outStream.writeInt(chunksToSave.size());
         for (SlimeChunk chunk : chunksToSave) {
             outStream.writeInt(chunk.getX());

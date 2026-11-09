@@ -7,6 +7,20 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.*;
 
 class LinkConfigurationTestSuite {
+    @Test void asyncSaveDefaultsAreAddedOnceAndLimitsAreValidated()throws Exception{
+        Files.writeString(file(),"# keep me\nmode: disabled\n");var config=load();
+        assertEquals(30,config.saveIntervalSeconds());assertEquals(4,config.saveWorkers());
+        String text=Files.readString(file());assertTrue(text.contains("saving:"));load();assertEquals(text,Files.readString(file()));
+        for(String setting:List.of("workers: 0","workers: 17","interval-seconds: 0","interval-seconds: 3601")){
+            Files.writeString(file(),"saving:\n  "+setting+"\n");assertThrows(IllegalArgumentException.class,this::load);
+        }
+    }
+    @Test void existingSavingSectionGetsTimeoutDefaultsOnce()throws Exception{
+        Files.writeString(file(),"saving:\n  workers: 2\n  interval-seconds: 45\n");var config=load();
+        assertEquals(120,config.saveStallSeconds());assertEquals(1800,config.saveTimeoutSeconds());assertEquals(2,config.saveWorkers());
+        String first=Files.readString(file());assertTrue(first.contains("retention:"));assertTrue(first.contains("total-timeout-seconds: 1800"));load();assertEquals(first,Files.readString(file()));
+        Files.writeString(file(),"saving:\n  stall-timeout-seconds: 120\n  total-timeout-seconds: 60\n");assertThrows(IllegalArgumentException.class,this::load);
+    }
     @TempDir Path directory;
     private Path file(){return directory.resolve("link.yml");}
     private LinkConfiguration load(){return LinkConfiguration.load(file(),Map.of(),new Properties());}

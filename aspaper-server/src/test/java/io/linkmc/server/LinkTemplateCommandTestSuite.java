@@ -22,6 +22,11 @@ class LinkTemplateCommandTestSuite {
         when(editors.exit(any())).thenReturn(new CompletableFuture<>());
         command=new LinkTemplateCommand(api,new LinkCompletions(List::of,"lobby"));
     }
+    @Test void settingsAliasesOpenGuiAndSuggestSettings(){
+        when(editors.openSettings(id)).thenReturn(new CompletableFuture<>());
+        command.execute(player,"템플릿",new String[]{"설정"});command.execute(player,"template",new String[]{"gui"});verify(editors,times(2)).openSettings(id);
+        assertTrue(command.tabComplete(player,"템플릿",new String[]{"설"}).contains("설정"));
+    }
     @Test void koreanCommandsCallSameEditorApi(){
         command.execute(player,"템플릿",new String[]{"생성","draft"});verify(editors).create(id,"draft");
         command.execute(player,"템플릿",new String[]{"편집","lobby","1"});verify(editors).edit(id,"lobby",1);

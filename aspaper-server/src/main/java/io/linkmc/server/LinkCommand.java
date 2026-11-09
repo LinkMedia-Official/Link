@@ -72,7 +72,8 @@ final class LinkCommand extends Command {
                 else if(result instanceof List<?> list){
                     if(list.isEmpty())sender.sendMessage("목록이 비어 있습니다.");
                     for(Object entry:list)sender.sendMessage(entry instanceof LinkApi.WorldInfo world
-                        ?world.name()+" | "+(world.persistent()?"영구":"임시")+" | 플레이어 "+world.players()+"명":entry.toString());
+                        ?world.name()+" | "+(world.persistent()?"영구":"임시")+" | 플레이어 "+world.players()+"명":entry instanceof LinkApi.WarpGroup group
+                        ?group.name()+" | 템플릿 "+group.template()+":"+group.version()+" | 채널당 "+group.policy().capacity()+"명 | 최대 "+group.policy().maxChannels()+"개 | "+(group.policy().networkWide()?"네트워크 전체":group.homeNode()):entry instanceof LinkApi.Channel channel?channel.world()+" | 서버 "+channel.node()+" | 입장 "+channel.occupied()+"명 + 예약 "+channel.reserved()+"명 / "+channel.capacity()+"명":entry.toString());
                 }
             }
         }));

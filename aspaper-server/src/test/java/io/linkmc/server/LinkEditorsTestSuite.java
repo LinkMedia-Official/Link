@@ -42,6 +42,14 @@ class LinkEditorsTestSuite {
     }
     @AfterEach void close(){bukkit.close();}
     static void done(CompletionStage<?> stage){stage.toCompletableFuture().join();}
+    @Test void settingsRejectWrongWorldOrRevokedPermissionAndSaveValidChanges(){
+        done(editors.create(id,"draft"));UUID workId=UUID.randomUUID();when(work.getUID()).thenReturn(workId);
+        var change=new java.util.concurrent.atomic.AtomicBoolean();
+        assertThrows(CompletionException.class,()->done(editors.configure(id,workId,w->change.set(true))));assertFalse(change.get());
+        when(player.hasPermission("link.admin")).thenReturn(true);
+        assertThrows(CompletionException.class,()->done(editors.configure(id,UUID.randomUUID(),w->change.set(true))));assertFalse(change.get());
+        done(editors.configure(id,workId,w->change.set(true)));assertTrue(change.get());verify(worlds,atLeast(2)).save("draft");
+    }
     @Test void createSaveExitPreservesOriginalLocation(){
         done(editors.create(id,"draft"));assertSame(work,location.get().getWorld());
         done(editors.save(id,"lobby",2,true));

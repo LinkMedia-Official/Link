@@ -8,7 +8,7 @@ import java.sql.*;
 import java.util.*;
 import static io.linkmc.core.Database.*;
 
-/** Durable after-state event sourcing with atomic multi-aggregate commits. */
+/** Latest-state storage with atomic multi-aggregate commits. Name retained for binary compatibility. */
 public final class EventStore {
     private final Database db;
     public EventStore(Database db) { this.db = db; }
@@ -33,7 +33,9 @@ public final class EventStore {
     public Commit commit(Transaction tx) throws Exception {
         return db.transaction(c -> commit(c,tx));
     }
-    Commit commit(Connection c,Transaction tx) throws Exception {
+    public Commit commit(Transaction tx,Runnable progress)throws Exception{return db.transaction(c->commit(c,tx,progress));}
+    Commit commit(Connection c,Transaction tx)throws Exception{return commit(c,tx,()->{});}
+    private Commit commit(Connection c,Transaction tx,Runnable progress) throws Exception {
         byte[] digest = digest(tx);
             lock(c, "operation:" + tx.operation());
             try (var s = sql(c, "SELECT digest FROM link_operations WHERE id=?", tx.operation()); var r = s.executeQuery()) {
@@ -53,22 +55,35 @@ public final class EventStore {
                     if (tx.guards().stream().noneMatch(s -> s.player().equals(player)))
                         throw new ConflictException("Player change requires a session guard");
                 }
-                lock(c, "aggregate:" + change.id());
-                long version = read(c, change.id()).map(State::version).orElse(0L);
-                if (version != change.expectedVersion()) throw new ConflictException("Version conflict: " + change.id());
-                if (version == Long.MAX_VALUE) throw new ConflictException("Version exhausted");
+                if (change.expectedVersion() == Long.MAX_VALUE) throw new ConflictException("Version exhausted");
             }
-            update(c, "INSERT INTO link_operations(id,digest) VALUES (?,?)", tx.operation(), digest);
-            for (Change change : changes) {
-                long next = change.expectedVersion() + 1;
-                update(c, "INSERT INTO link_events(aggregate_id,version,operation,schema_version,type,payload) VALUES (?,?,?,?,?,?)",
-                        change.id(), next, tx.operation(), change.schema(), change.type(), change.after());
-                update(c, "INSERT INTO link_state(id,version,schema_version,payload) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,schema_version=excluded.schema_version,payload=excluded.payload",
-                        change.id(), next, change.schema(), change.after());
+            update(c, "INSERT INTO link_operations(id,digest,events_pruned) VALUES (?,?,true)", tx.operation(), digest);
+            // Conditional row writes protect versions without an advisory lock per key.
+            // Stable ordering prevents opposite-order multi-row writers from deadlocking.
+            // Every write and the receipt/outbox remain in this single SQL transaction.
+            try(var insert=c.prepareStatement("INSERT INTO link_state(id,version,schema_version,payload) VALUES (?,1,?,?)");
+                var replace=c.prepareStatement("UPDATE link_state SET version=?,schema_version=?,payload=? WHERE id=? AND version=?")){
+                for(Change change:changes){
+                    if(change.expectedVersion()==0){
+                        insert.setString(1,change.id());insert.setInt(2,change.schema());insert.setBytes(3,change.after());
+                        try{insert.executeUpdate();}catch(SQLException error){
+                            if("23505".equals(error.getSQLState())||error.getErrorCode()==1062)
+                                throw new ConflictException("Version conflict: "+change.id());
+                            throw error;
+                        }
+                    }else{
+                        replace.setLong(1,change.expectedVersion()+1);replace.setInt(2,change.schema());replace.setBytes(3,change.after());
+                        replace.setString(4,change.id());replace.setLong(5,change.expectedVersion());
+                        if(replace.executeUpdate()!=1)throw new ConflictException("Version conflict: "+change.id());
+                    }
+                    progress.run();
+                }
             }
             update(c, "INSERT INTO link_outbox(id) VALUES (?)", tx.operation());
             return new Commit(tx.operation(), false);
     }
+    /** Legacy, read-only history. New commits do not create events. */
+    @Deprecated
     public List<Event> history(String id, long after, int limit) throws Exception {
         if (after < 0 || limit < 1 || limit > 1000) throw new IllegalArgumentException("Invalid event page");
         return db.transaction(c -> {
@@ -80,7 +95,8 @@ public final class EventStore {
             return List.copyOf(events);
         });
     }
-    /** Reconstruct a single aggregate to a recorded revision, without gameplay side effects. */
+    /** Reads legacy history only; never used for recovery. New revisions have no historical replay. */
+    @Deprecated
     public Optional<State> replay(String id, long version) throws Exception {
         if (version < 0) throw new IllegalArgumentException("Invalid revision");
         return db.transaction(c -> {

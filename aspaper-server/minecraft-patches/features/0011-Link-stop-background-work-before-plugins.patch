@@ -1,0 +1,16 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Link <link@localhost>
+Date: Wed, 4 Nov 2026 02:00:00 +0900
+Subject: [PATCH] Stop Link background work before disabling plugins
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1001,6 +1001,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTask>
+         org.spigotmc.WatchdogThread.doStop(); // Paper - Improved watchdog support
+         // CraftBukkit end
++        io.linkmc.server.LinkRuntime.beginShutdown();
+         this.packetProcessor.close();
+         if (this.metricsRecorder.isRecording()) {
+             this.cancelRecordingMetrics();
+         }

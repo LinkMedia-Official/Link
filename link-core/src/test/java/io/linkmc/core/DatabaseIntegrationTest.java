@@ -19,20 +19,289 @@ class DatabaseIntegrationTest {
         Assumptions.assumeTrue(url!=null,"Set LINK_TEST_JDBC_URL for PostgreSQL integration tests");
         db=new Database(() -> DriverManager.getConnection(url,System.getenv("LINK_TEST_DB_USER"),System.getenv("LINK_TEST_DB_PASSWORD")));
         db.migrate();
-        db.transaction(c -> {for(String table:"link_teleport_requests,link_player_names,link_routes,link_arrivals,link_reservations,link_channels,link_nodes,link_transfers,link_sessions,link_outbox,link_events,link_state,link_operations,link_templates,link_warps".split(","))update(c,"DELETE FROM "+table);return null;});
+        db.transaction(c -> {for(String table:"link_route_receipts,link_group_requests,link_group_worlds,link_warp_groups,link_template_channels,link_teleport_requests,link_player_names,link_routes,link_arrivals,link_reservations,link_channels,link_nodes,link_transfers,link_sessions,link_outbox,link_events,link_state,link_operations,link_templates,link_warps".split(","))update(c,"DELETE FROM "+table);return null;});
         events=new EventStore(db);sessions=new SessionStore(db,30);network=new NetworkStore(db);
+    }
+    @Test void maximumCheckpointUsesBoundedAdvisoryLocksAndRollsBackLateConflict()throws Exception{
+        List<Change> initial=new ArrayList<>();
+        for(int i=0;i<65536;i++)initial.add(new Change(String.format("large:%05d",i),0,1,"test",new byte[]{1}));
+        var first=new Transaction(UUID.randomUUID(),List.of(),initial);
+        db.transaction(c->{
+            events.commit(c,first);
+            if(!maria(c))try(var q=sql(c,"SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory'");var r=q.executeQuery()){
+                assertTrue(r.next());assertEquals(1,r.getInt(1),"Only operation lock; no per-key advisory locks");
+            }
+            return null;
+        });
+        List<Change> updated=new ArrayList<>();
+        for(Change change:initial)updated.add(new Change(change.id(),1,1,"test",new byte[]{2}));
+        var second=new Transaction(UUID.randomUUID(),List.of(),updated);events.commit(second);
+        assertTrue(events.commit(second).duplicate());
+        UUID failed=UUID.randomUUID();
+        assertThrows(ConflictException.class,()->events.commit(new Transaction(failed,List.of(),List.of(
+            new Change("large:00000",2,1,"test",new byte[]{3}),new Change("large:65535",1,1,"test",new byte[]{3})))));
+        assertEquals(2,events.read("large:00000").orElseThrow().version());
+        assertArrayEquals(new byte[]{2},events.read("large:00000").orElseThrow().payload());
+        db.transaction(c->{try(var q=sql(c,"SELECT count(*) FROM link_operations WHERE id=?",failed);var r=q.executeQuery()){assertTrue(r.next());assertEquals(0,r.getInt(1));}return null;});
+    }
+    @Test void unguardedConcurrentWritersCannotLoseUpdates()throws Exception{
+        try(var pool=Executors.newFixedThreadPool(8)){
+            for(long version=0;version<2;version++){
+                final long expected=version;var start=new CountDownLatch(1);List<Future<Boolean>> attempts=new ArrayList<>();
+                for(int i=0;i<8;i++)attempts.add(pool.submit(()->{start.await();try{
+                    events.commit(new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("race",expected,1,"test",new byte[]{1}))));return true;
+                }catch(ConflictException conflict){return false;}}));
+                start.countDown();int wins=0;for(var attempt:attempts)if(attempt.get(10,TimeUnit.SECONDS))wins++;assertEquals(1,wins);
+            }
+        }
+        assertEquals(2,events.read("race").orElseThrow().version());
+    }
+    private Destination travelSetup(String node,String channel)throws Exception{
+        var d=new Destination(node,channel,8,66,8,90,0);network.heartbeat(node,100);network.register(channel,d,50);return d;
+    }
+    @Test void localTravelKeepsEpochAndDuplicateRequestsReturnOriginalReceipt()throws Exception{
+        var d=travelSetup("a","spawn-a");var owner=sessions.acquire(UUID.randomUUID(),"a");
+        var routes=new RouteStore(db);UUID operation=UUID.randomUUID();var reservation=routes.requestTravel(owner.player(),operation,d);
+        var request=new RouteStore.Request(operation,reservation);assertTrue(routes.claim(request,owner));assertFalse(routes.claim(request,owner));
+        assertEquals(owner.epoch(),sessions.renew(owner).epoch());
+        assertEquals(d,routes.completeLocal(request,owner));assertEquals(d,routes.completeLocal(request,owner));assertFalse(routes.claim(request,owner));
+        assertEquals(owner.epoch(),sessions.renew(owner).epoch());assertEquals("COMPLETE",routes.status(operation));
+        assertEquals(reservation,routes.requestTravel(owner.player(),operation,d));
+        assertTrue(sessions.disconnect(owner));var next=sessions.acquire(owner.player(),"a");
+        assertEquals(reservation,routes.requestTravel(owner.player(),operation,d));assertFalse(routes.claim(request,next));
+        assertThrows(ConflictException.class,()->routes.requestTravel(owner.player(),operation,new Destination("a","spawn-a",9,66,8,0,0)));
+        db.transaction(c->{try(var q=sql(c,"SELECT count(*) FROM link_transfers WHERE player=?",owner.player());var r=q.executeQuery()){r.next();assertEquals(0,r.getInt(1));}return null;});
+    }
+    @Test void remoteTravelPrepareIsAtomicAndAcceptedEpochSurvivesSourceDisconnect()throws Exception{
+        var d=travelSetup("b","spawn-b");var owner=sessions.acquire(UUID.randomUUID(),"a");var routes=new RouteStore(db);UUID id=UUID.randomUUID();
+        var reservation=routes.requestTravel(owner.player(),id,d);var request=new RouteStore.Request(id,reservation);
+        assertTrue(routes.claim(request,owner));routes.prepareRemote(request,owner);routes.prepareRemote(request,owner);assertTrue(sessions.renewMoving(owner));routes.ready(id);
+        var arrived=new ArrivalStore(db).claim(owner.player(),"b");assertEquals(owner.epoch()+1,arrived.session().epoch());
+        assertFalse(sessions.disconnect(owner));assertFalse(sessions.renewMoving(owner));assertEquals(arrived.session().epoch(),sessions.renew(arrived.session()).epoch());
+        routes.finish(id,true);assertEquals(reservation,routes.requestTravel(owner.player(),id,d));assertFalse(routes.claim(request,arrived.session()));
+        assertThrows(ConflictException.class,()->new ArrivalStore(db).claim(owner.player(),"b"));
+    }
+    @Test void failedRemoteIssueRollsBackOwnershipAndDisconnectCancelsPendingTransfer()throws Exception{
+        var d=travelSetup("b","spawn-b");var owner=sessions.acquire(UUID.randomUUID(),"a");var routes=new RouteStore(db);UUID id=UUID.randomUUID();
+        var request=new RouteStore.Request(id,routes.requestTravel(owner.player(),id,d));assertTrue(routes.claim(request,owner));
+        network.ready("spawn-b",false);assertThrows(ConflictException.class,()->routes.prepareRemote(request,owner));
+        assertEquals(owner.epoch(),sessions.renew(owner).epoch());network.ready("spawn-b",true);
+        routes.prepareRemote(request,owner);assertFalse(sessions.available(owner.player()));assertTrue(sessions.disconnect(owner));assertTrue(sessions.available(owner.player()));
+        assertEquals("FAILED",routes.status(id));assertThrows(ConflictException.class,()->new ArrivalStore(db).claim(owner.player(),"b"));
+        assertEquals(owner.epoch()+1,sessions.acquire(owner.player(),"a").epoch());
+    }
+    @Test void concurrentRouteClaimOnlyOneWinsAndExpiredRouteFailsWithoutChangingOwner()throws Exception{
+        var d=travelSetup("a","spawn-a");var owner=sessions.acquire(UUID.randomUUID(),"a");var routes=new RouteStore(db);UUID id=UUID.randomUUID();
+        var request=new RouteStore.Request(id,routes.requestTravel(owner.player(),id,d));
+        try(var pool=Executors.newFixedThreadPool(8)){
+            List<Future<Boolean>> claims=new ArrayList<>();for(int i=0;i<8;i++)claims.add(pool.submit(()->routes.claim(request,owner)));
+            int wins=0;for(var result:claims)if(result.get(10,TimeUnit.SECONDS))wins++;assertEquals(1,wins);
+        }
+        routes.reject(request);assertEquals(owner.epoch(),sessions.renew(owner).epoch());
+        UUID stale=UUID.randomUUID();var staleRequest=new RouteStore.Request(stale,routes.requestTravel(owner.player(),stale,d));
+        db.transaction(c->{update(c,"UPDATE link_reservations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=?",stale);return null;});
+        assertThrows(ConflictException.class,()->routes.claim(staleRequest,owner));routes.reject(staleRequest);
+        assertEquals("FAILED",routes.status(stale));assertEquals(owner.epoch(),sessions.renew(owner).epoch());
+    }
+    @Test void crashedSourcePinnedReservationIsReapedBeforeReconnect()throws Exception{
+        var d=travelSetup("a","spawn-a");var owner=sessions.acquire(UUID.randomUUID(),"a");var routes=new RouteStore(db);UUID id=UUID.randomUUID();
+        var request=new RouteStore.Request(id,routes.requestTravel(owner.player(),id,d));assertTrue(routes.claim(request,owner));
+        assertFalse(sessions.available(owner.player()));
+        db.transaction(c->{update(c,"UPDATE link_sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE player=?",owner.player());return null;});
+        assertTrue(sessions.available(owner.player()));assertEquals("FAILED",routes.status(id));
+        UUID ticket=UUID.randomUUID();var reservation=network.reserve(owner.player(),ticket,d);new ArrivalStore(db).issue(ticket,reservation,null);
+        assertFalse(sessions.disconnect(owner));var arrived=new ArrivalStore(db).claim(owner.player(),"a");assertEquals(owner.epoch()+1,arrived.session().epoch());
+    }
+    private Database independentDatabase(){return new Database(()->DriverManager.getConnection(System.getenv("LINK_TEST_JDBC_URL"),System.getenv("LINK_TEST_DB_USER"),System.getenv("LINK_TEST_DB_PASSWORD")));}
+    @Test void checkpointGuardDoesNotBlockLeaseRenewal()throws Exception{
+        var owner=sessions.acquireNode("node-a");var locked=new CountDownLatch(1);var finish=new CountDownLatch(1);
+        try(var pool=Executors.newFixedThreadPool(2)){
+            var checkpoint=pool.submit(()->db.transaction(c->{SessionStore.requireActive(c,owner);locked.countDown();assertTrue(finish.await(8,TimeUnit.SECONDS));return null;}));
+            try{assertTrue(locked.await(2,TimeUnit.SECONDS));var renewed=pool.submit(()->sessions.renew(owner));
+                assertEquals(owner.epoch(),renewed.get(2,TimeUnit.SECONDS).epoch());
+                var takeover=pool.submit(()->sessions.acquireNode("node-a"));
+                assertThrows(TimeoutException.class,()->takeover.get(200,TimeUnit.MILLISECONDS));
+                finish.countDown();checkpoint.get();takeover.get(5,TimeUnit.SECONDS);
+            }finally{finish.countDown();}
+        }
+    }
+    @Test void renewalRetriesTemporaryRowLockTimeout()throws Exception{
+        var owner=sessions.acquireNode("node-a");var locked=new CountDownLatch(1);
+        try(var pool=Executors.newSingleThreadExecutor()){
+            var blocker=pool.submit(()->db.transaction(c->{try(var q=sql(c,"SELECT player FROM link_sessions WHERE player=? FOR UPDATE",owner.player());var r=q.executeQuery()){assertTrue(r.next());locked.countDown();Thread.sleep(5600);}return null;}));
+            assertTrue(locked.await(2,TimeUnit.SECONDS));assertEquals(owner.epoch(),sessions.renew(owner).epoch());blocker.get();
+        }
+    }
+    @Test void renewalCannotReviveLeaseThatExpiresWhileWaitingForRow()throws Exception{
+        var owner=sessions.acquireNode("node-a");
+        db.transaction(c->{update(c,"UPDATE link_sessions SET expires_at=clock_timestamp()+?*interval '1 second' WHERE player=?",1,owner.player());return null;});
+        var locked=new CountDownLatch(1);
+        try(var pool=Executors.newSingleThreadExecutor()){
+            var blocker=pool.submit(()->db.transaction(c->{try(var q=sql(c,"SELECT player FROM link_sessions WHERE player=? FOR UPDATE",owner.player());var r=q.executeQuery()){assertTrue(r.next());locked.countDown();Thread.sleep(1800);}return null;}));
+            assertTrue(locked.await(2,TimeUnit.SECONDS));assertThrows(ConflictException.class,()->sessions.renew(owner));blocker.get();
+        }
+    }
+    @Test void renewalNeverRevivesExpiredLease()throws Exception{
+        var owner=sessions.acquireNode("node-a");db.transaction(c->{update(c,"UPDATE link_sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE player=?",owner.player());return null;});
+        assertThrows(ConflictException.class,()->sessions.renew(owner));
+    }
+    @Test void nodeTakeoverRevokesOldPlayersButPreservesOtherNodes()throws Exception{
+        var first=sessions.acquireNode("node-a");var player=sessions.acquire(UUID.randomUUID(),"node-a");
+        var other=sessions.acquire(UUID.randomUUID(),"node-b");
+        var moving=sessions.acquire(UUID.randomUUID(),"node-a");
+        var transfer=sessions.prepare(moving,UUID.randomUUID(),new Destination("node-b","world",0,65,0,0,0));
+        var second=sessions.acquireNode("node-a");assertEquals(first.epoch()+1,second.epoch());
+        assertThrows(ConflictException.class,()->sessions.renew(first));
+        assertThrows(ConflictException.class,()->sessions.renew(player));
+        assertThrows(ConflictException.class,()->sessions.accept(moving.player(),transfer.id(),"node-b"));
+        assertFalse(sessions.releaseNode(first));assertEquals(other.epoch(),sessions.renew(other).epoch());
+        assertTrue(sessions.releaseNode(second));assertFalse(sessions.releaseNode(second));
+        assertEquals(second.epoch()+1,sessions.acquireNode("node-a").epoch());
+    }
+    @Test void boundBackendCanReleaseAndImmediatelyRestart()throws Exception{
+        var owner=sessions.acquireNode("node-a");
+        try(var backend=independentDatabase()){
+            backend.nodeOwner(()->owner);assertTrue(new SessionStore(backend,30).releaseNode(owner));
+            assertThrows(ConflictException.class,()->backend.transaction(c->1));
+            assertEquals(owner.epoch()+1,sessions.acquireNode("node-a").epoch());
+        }
+    }
+    @Test void concurrentNodeStartupsPublishDistinctEpochs()throws Exception{
+        try(var pool=Executors.newFixedThreadPool(2)){
+            var start=new CountDownLatch(1);
+            Callable<Session> acquire=()->{start.await();return sessions.acquireNode("node-a");};
+            var one=pool.submit(acquire);var two=pool.submit(acquire);start.countDown();
+            var a=one.get(10,TimeUnit.SECONDS);var b=two.get(10,TimeUnit.SECONDS);
+            assertNotEquals(a.epoch(),b.epoch());var old=a.epoch()<b.epoch()?a:b;var current=a.epoch()>b.epoch()?a:b;
+            assertThrows(ConflictException.class,()->sessions.renew(old));assertEquals(current.epoch(),sessions.renew(current).epoch());
+        }
+    }
+    @Test void backendGuardFencesAllTransactionsAndStaleShutdown()throws Exception{
+        var first=sessions.acquireNode("node-a");
+        try(var old=independentDatabase()){
+            old.nodeOwner(()->first);assertEquals(1,old.<Integer>transaction(c->1).intValue());
+            var second=sessions.acquireNode("node-a");
+            assertThrows(ConflictException.class,()->new NetworkStore(old).heartbeat("node-a",100));
+            assertThrows(ConflictException.class,()->new SessionStore(old,30).releaseNode(first));
+            assertEquals(second.epoch(),sessions.renew(second).epoch());
+        }
+    }
+    @Test void takeoverWaitsForInFlightWritesWhileReadersRemainConcurrent()throws Exception{
+        var first=sessions.acquireNode("node-a");
+        try(var old=independentDatabase();var pool=Executors.newFixedThreadPool(3)){
+            old.nodeOwner(()->first);var entered=new CountDownLatch(2);var finish=new CountDownLatch(1);
+            Callable<Integer> work=()->old.transaction(c->{entered.countDown();assertTrue(finish.await(4,TimeUnit.SECONDS));return 1;});
+            var one=pool.submit(work);var two=pool.submit(work);
+            try{
+                assertTrue(entered.await(3,TimeUnit.SECONDS),"Backend transactions must overlap");
+                var takeover=pool.submit(()->sessions.acquireNode("node-a"));
+                assertThrows(TimeoutException.class,()->takeover.get(200,TimeUnit.MILLISECONDS));
+                finish.countDown();assertEquals(1,one.get());assertEquals(1,two.get());
+                assertEquals(first.epoch()+1,takeover.get(5,TimeUnit.SECONDS).epoch());
+                assertThrows(ConflictException.class,()->old.transaction(c->1));
+            }finally{finish.countDown();}
+        }
+    }
+    @Test void provisionedSpawnUsesTemplatePositionAndView()throws Exception{
+        network.heartbeat("node-a",100);
+        Worlds worlds=(Worlds)java.lang.reflect.Proxy.newProxyInstance(Worlds.class.getClassLoader(),new Class[]{Worlds.class},(proxy,method,args)->switch(method.getName()){
+            case "create"->CompletableFuture.completedFuture(new WorldInfo((String)args[0],false,0));
+            case "spawn"->CompletableFuture.completedFuture(new Destination("node-a",(String)args[0],2.25,65,3.75,123,17));
+            default->throw new UnsupportedOperationException(method.getName());
+        });
+        assertTrue(new SpawnProvisioner(worlds,network,"node-a","lobby",1,50,3).ensureSpare().toCompletableFuture().get(10,TimeUnit.SECONDS));
+        var channel=network.spawnChannels().getFirst();
+        var reservation=network.reserve(UUID.randomUUID(),UUID.randomUUID());
+        assertEquals(2.25,reservation.destination().x());assertEquals(123,reservation.destination().yaw());assertEquals(17,reservation.destination().pitch());
+        assertEquals(channel.world(),reservation.destination().world());
+    }
+    @Test void groupPolicyImmutableAndFixedWarpNamesCannotCollide()throws Exception{
+        var templates=new TemplateStore(db);var p=new ChannelPolicy(1,2,true,true);templates.publish("mine",1,new byte[]{1,2},p);
+        assertThrows(ConflictException.class,()->templates.publish("mine",1,new byte[]{1,2},ChannelPolicy.defaults()));
+        var groups=new WarpGroupStore(db);groups.bind("mines","mine",1,"node-a");assertEquals(p,groups.list().getFirst().policy());
+        assertThrows(ConflictException.class,()->network.setWarp("mines",new Destination("node-a","world",0,65,0,0,0)));
+        assertTrue(network.warps().contains("mines"));assertTrue(network.deleteWarp("mines"));assertTrue(groups.list().isEmpty());
+    }
+    @Test void groupCreatesAcrossNodesAndRespectsCapacityAndMaximum()throws Exception{
+        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,2,true,true));
+        network.heartbeat("node-a",10);network.heartbeat("node-b",10);groups.bind("mines","mine",1,"node-a");
+        Session nodeA=sessions.acquire(UUID.randomUUID(),"node-a"),nodeB=sessions.acquire(UUID.randomUUID(),"node-b");
+        Session a=sessions.acquire(UUID.randomUUID(),"node-a"),b=sessions.acquire(UUID.randomUUID(),"node-a"),c=sessions.acquire(UUID.randomUUID(),"node-a");
+        UUID one=UUID.randomUUID(),two=UUID.randomUUID(),three=UUID.randomUUID();groups.enqueue(a.player(),one,"mines");groups.provisionDemand();
+        var first=groups.jobs("node-a").getFirst();groups.ready(first,new Destination("node-a",first.world(),7.25,65,8.75,90,12),nodeA);
+        var route=groups.dispatch(groups.pending("node-a").getFirst()).orElseThrow();assertEquals(7.25,route.reservation().destination().x());assertEquals("DISPATCHED",groups.status(one));
+        assertTrue(network.spawnChannels().isEmpty());assertThrows(ConflictException.class,()->network.reserve(UUID.randomUUID(),UUID.randomUUID()));
+        groups.enqueue(b.player(),two,"mines");groups.provisionDemand();var second=groups.jobs("node-b").getFirst();groups.ready(second,new Destination("node-b",second.world(),7.25,65,8.75,90,12),nodeB);
+        assertEquals("node-b",groups.dispatch(groups.pending("node-a").getFirst()).orElseThrow().reservation().destination().node());
+        groups.enqueue(c.player(),three,"mines");assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isEmpty());groups.provisionDemand();assertTrue(groups.jobs("node-a").isEmpty());assertTrue(groups.jobs("node-b").isEmpty());
+        assertEquals(2,network.channels().size());assertEquals("WAITING",groups.status(three));
+    }
+    @Test void concurrentDemandOnlyCreatesOneJobAndLocalPolicyDoesNotUseOtherNodes()throws Exception{
+        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,3,true,false));
+        network.heartbeat("node-a",20);network.heartbeat("node-b",20);groups.bind("mines","mine",1,"node-a");
+        for(int i=0;i<8;i++){var p=sessions.acquire(UUID.randomUUID(),"node-b");groups.enqueue(p.player(),UUID.randomUUID(),"mines");}
+        try(var pool=Executors.newFixedThreadPool(8)){var jobs=new ArrayList<Future<?>>();for(int i=0;i<8;i++)jobs.add(pool.submit(()->{try{groups.provisionDemand();}catch(Exception e){throw new RuntimeException(e);}}));for(var f:jobs)f.get();}
+        assertEquals(1,groups.jobs("node-a").size());assertTrue(groups.jobs("node-b").isEmpty());
+    }
+    @Test void groupWaitExpiryAndSessionChangesNeverDispatch()throws Exception{
+        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1});groups.bind("mines","mine",1,"node-a");
+        Session p=sessions.acquire(UUID.randomUUID(),"node-a");UUID id=UUID.randomUUID();groups.enqueue(p.player(),id,"mines");
+        groups.enqueue(p.player(),id,"mines");assertEquals(1,groups.pending("node-a").size());
+        assertThrows(ConflictException.class,()->groups.enqueue(p.player(),UUID.randomUUID(),"mines"));
+        sessions.release(p);sessions.acquire(p.player(),"node-a");assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isEmpty());assertEquals("FAILED",groups.status(id));
+        UUID expired=UUID.randomUUID();groups.enqueue(p.player(),expired,"mines");db.transaction(c->{update(c,"UPDATE link_group_requests SET expires_at=clock_timestamp()-interval '1 second' WHERE id=?",expired);return null;});
+        assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isEmpty());assertEquals("FAILED",groups.status(expired));assertEquals("MISSING",new RouteStore(db).status(expired));
+    }
+    @Test void disabledAutoExpansionKeepsSingleChannel()throws Exception{
+        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,3,false,false));network.heartbeat("node-a",10);groups.bind("mines","mine",1,"node-a");
+        var node=sessions.acquire(UUID.randomUUID(),"node-a");var a=sessions.acquire(UUID.randomUUID(),"node-a");groups.enqueue(a.player(),UUID.randomUUID(),"mines");groups.provisionDemand();var job=groups.jobs("node-a").getFirst();groups.ready(job,new Destination("node-a",job.world(),0,65,0,0,0),node);groups.dispatch(groups.pending("node-a").getFirst());
+        var b=sessions.acquire(UUID.randomUUID(),"node-a");groups.enqueue(b.player(),UUID.randomUUID(),"mines");groups.provisionDemand();assertTrue(groups.jobs("node-a").isEmpty());
+    }
+    @Test void groupDispatchAndOutboxFailureRollBackReservationAndRoute()throws Exception{
+        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,1,true,false));network.heartbeat("node-a",10);groups.bind("mines","mine",1,"node-a");
+        var owner=sessions.acquire(UUID.randomUUID(),"node-a");var player=sessions.acquire(UUID.randomUUID(),"node-a");UUID id=UUID.randomUUID();groups.enqueue(player.player(),id,"mines");groups.provisionDemand();var job=groups.jobs("node-a").getFirst();groups.ready(job,new Destination("node-a",job.world(),1,65,2,0,0),owner);
+        UUID operation=UUID.nameUUIDFromBytes(("group:"+id+":DISPATCHED").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        db.transaction(c->{update(c,"ALTER TABLE link_outbox ADD CONSTRAINT test_group_reject CHECK (id <> '"+operation+"')");return null;});
+        try{assertThrows(Exception.class,()->groups.dispatch(groups.pending("node-a").getFirst()));assertEquals("WAITING",groups.status(id));assertEquals("MISSING",new RouteStore(db).status(id));assertEquals(0,network.channels().getFirst().reserved());}
+        finally{db.transaction(c->{update(c,"ALTER TABLE link_outbox DROP CONSTRAINT test_group_reject");return null;});}
+        assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isPresent());assertEquals(1,network.channels().getFirst().reserved());
+    }
+    @Test void groupRequestsRetainIdempotencyAfterPruningAndDeletedNamesStayRetired()throws Exception{
+        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1});groups.bind("mines","mine",1,"node-a");var p=sessions.acquire(UUID.randomUUID(),"node-a");UUID id=UUID.randomUUID();groups.enqueue(p.player(),id,"mines");
+        db.transaction(c->{update(c,"UPDATE link_group_requests SET expires_at=? WHERE id=?",java.sql.Timestamp.from(java.time.Instant.now().minusSeconds(259200)),id);return null;});
+        assertEquals(1,new EventRetention(db).prune(24,100).requests());assertThrows(ConflictException.class,()->groups.enqueue(p.player(),id,"mines"));
+        assertTrue(network.deleteWarp("mines"));assertThrows(ConflictException.class,()->groups.bind("mines","mine",1,"node-a"));
     }
     private Transaction change(Session s,UUID op,long expected,String value) {
         return new Transaction(op,List.of(s),List.of(new Change("player:"+s.player(),expected,1,"test:set",value.getBytes(java.nio.charset.StandardCharsets.UTF_8))));
     }
+    @Test void latestStateCommitWorksWhenEventInsertsAreForbidden()throws Exception{
+        db.transaction(c->{update(c,"ALTER TABLE link_events ADD CONSTRAINT test_no_history CHECK (version < 0)");return null;});
+        try{
+            var owner=sessions.acquire(UUID.randomUUID(),"node-a");var tx=change(owner,UUID.randomUUID(),0,"current");
+            events.commit(tx);assertTrue(events.commit(tx).duplicate());
+            assertArrayEquals("current".getBytes(),new EventStore(db).read("player:"+owner.player()).orElseThrow().payload());
+            assertTrue(events.history("player:"+owner.player(),0,100).isEmpty());
+            age(tx.operation());assertEquals(0,new EventRetention(db).prune(24,100).operations());
+        }finally{db.transaction(c->{update(c,"ALTER TABLE link_events DROP CONSTRAINT test_no_history");return null;});}
+    }
     private void age(UUID operation)throws Exception{
         db.transaction(c->{update(c,"UPDATE link_operations SET created_at=? WHERE id=?",java.sql.Timestamp.from(java.time.Instant.now().minus(java.time.Duration.ofDays(3))),operation);return null;});
     }
+    private Commit legacyCommit(Transaction tx)throws Exception{
+        Commit result=events.commit(tx);
+        db.transaction(c->{
+            update(c,"UPDATE link_operations SET events_pruned=false WHERE id=?",tx.operation());
+            for(Change change:tx.changes())update(c,"INSERT INTO link_events(aggregate_id,version,operation,schema_version,type,payload) VALUES (?,?,?,?,?,?)",change.id(),change.expectedVersion()+1,tx.operation(),change.schema(),change.type(),change.after());
+            return null;
+        });
+        return result;
+    }
     @Test void retentionPreservesStateIdempotencyAndPendingNotifications()throws Exception{
         Session owner=sessions.acquire(UUID.randomUUID(),"a");String key="player:"+owner.player();
-        Transaction first=change(owner,UUID.randomUUID(),0,"first");events.commit(first);age(first.operation());
-        Transaction second=change(owner,UUID.randomUUID(),1,"second");events.commit(second);age(second.operation());
-        Transaction latest=change(owner,UUID.randomUUID(),2,"latest");events.commit(latest);
+        Transaction first=change(owner,UUID.randomUUID(),0,"first");legacyCommit(first);age(first.operation());
+        Transaction second=change(owner,UUID.randomUUID(),1,"second");legacyCommit(second);age(second.operation());
+        Transaction latest=change(owner,UUID.randomUUID(),2,"latest");legacyCommit(latest);
         db.transaction(c->{update(c,"UPDATE link_outbox SET delivered=true WHERE id=?",first.operation());update(c,"UPDATE link_outbox SET delivered=true WHERE id=?",latest.operation());return null;});
         var retention=new EventRetention(db);var result=retention.prune(24,1);
         assertEquals(1,result.operations());assertEquals(1,result.events());assertEquals(1,result.notifications());
@@ -46,16 +315,17 @@ class DatabaseIntegrationTest {
         var restored=new FrameCommitter(tx->{throw new AssertionError("Unchanged recovered state must not write");});
         restored.restore(events.read(key).orElseThrow());restored.commit(List.of(owner),Map.of(key,"latest".getBytes()),()->{});
     }
-    @Test void retentionKeepsWholeTransactionWhenAnyAggregateStillUsesIt()throws Exception{
+    @Test void retentionCanRemoveLastLegacyEventWhilePreservingLatestState()throws Exception{
         var original=new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",0,1,"test",new byte[]{1}),new Change("b",0,1,"test",new byte[]{2})));
-        events.commit(original);age(original.operation());
-        events.commit(new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",1,1,"test",new byte[]{3}))));
-        assertEquals(0,new EventRetention(db).prune(24,100).events());
-        assertEquals(2,events.history("a",0,100).size());assertEquals(1,events.history("b",0,100).size());
+        legacyCommit(original);age(original.operation());
+        legacyCommit(new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",1,1,"test",new byte[]{3}))));
+        assertEquals(2,new EventRetention(db).prune(24,100).events());
+        assertEquals(1,events.history("a",0,100).size());assertTrue(events.history("b",0,100).isEmpty());
+        assertArrayEquals(new byte[]{2},events.read("b").orElseThrow().payload());
     }
     @Test void concurrentRetentionWorkersDeleteEachOldOperationOnce()throws Exception{
         for(int i=0;i<7;i++){
-            UUID operation=UUID.randomUUID();events.commit(new Transaction(operation,List.of(),List.of(new Change("a",i,1,"test",new byte[]{(byte)i}))));
+            UUID operation=UUID.randomUUID();legacyCommit(new Transaction(operation,List.of(),List.of(new Change("a",i,1,"test",new byte[]{(byte)i}))));
             if(i<6)age(operation);
         }
         try(var executor=Executors.newFixedThreadPool(2)){
@@ -65,20 +335,20 @@ class DatabaseIntegrationTest {
         assertEquals(1,events.history("a",0,100).size());assertEquals(7,events.read("a").orElseThrow().version());
     }
     @Test void retentionFailureRollsBackDeletedEvents()throws Exception{
-        UUID old=UUID.randomUUID();events.commit(new Transaction(old,List.of(),List.of(new Change("a",0,1,"test",new byte[]{1}))));age(old);
-        events.commit(new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",1,1,"test",new byte[]{2}))));
+        UUID old=UUID.randomUUID();legacyCommit(new Transaction(old,List.of(),List.of(new Change("a",0,1,"test",new byte[]{1}))));age(old);
+        legacyCommit(new Transaction(UUID.randomUUID(),List.of(),List.of(new Change("a",1,1,"test",new byte[]{2}))));
         db.transaction(c->{update(c,"ALTER TABLE link_operations ADD CONSTRAINT test_retention_reject CHECK (NOT events_pruned)");return null;});
         try{assertThrows(Exception.class,()->new EventRetention(db).prune(24,100));assertEquals(2,events.history("a",0,100).size());}
         finally{db.transaction(c->{update(c,"ALTER TABLE link_operations DROP CONSTRAINT test_retention_reject");return null;});}
     }
-    @Test void warpLifecycleIsSharedAndEventSourced()throws Exception{
+    @Test void warpLifecycleIsSharedAndStoresLatestState()throws Exception{
         var first=new Destination("a","shop-world",1.5,65,2.5,90,10);
         var second=new Destination("b","mall",3,70,4,-45,20);
         network.setWarp("shop",first);var otherBackend=new NetworkStore(db);
         assertEquals(first,otherBackend.warp("shop").orElseThrow());assertEquals(List.of("shop"),otherBackend.warps());
         otherBackend.setWarp("shop",second);assertEquals(second,network.warp("shop").orElseThrow());
         assertTrue(network.deleteWarp("shop"));assertFalse(otherBackend.deleteWarp("shop"));assertTrue(otherBackend.warps().isEmpty());
-        assertEquals(List.of("warp:set","warp:set","warp:delete"),events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).stream().map(Event::type).toList());
+        assertTrue(events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).isEmpty());
         assertEquals(3,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());assertEquals(0,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().payload().length);
     }
     @Test void maximumLengthWarpNameHasBoundedJournalIdentity()throws Exception{
@@ -120,7 +390,7 @@ class DatabaseIntegrationTest {
             List<Future<?>> tasks=new ArrayList<>();for(int i=0;i<8;i++){int x=i;tasks.add(executor.submit(()->{network.setWarp("shop",new Destination("a","shop",x,65,0,0,0));return null;}));}
             for(var task:tasks)task.get();
         }
-        assertEquals(8,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());assertEquals(8,events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).size());
+        assertEquals(8,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());assertTrue(events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).isEmpty());
         try(var service=new LinkService(db)){
             var tx=new Transaction(UUID.randomUUID(),List.of(),List.of(new Change(io.linkmc.api.LinkApi.warpStateId("shop"),8,1,"bad",new byte[]{1})));
             assertThrows(ExecutionException.class,()->service.data().commit(tx).toCompletableFuture().get());
@@ -144,7 +414,7 @@ class DatabaseIntegrationTest {
         }
         var route=new RouteStore(db).pending("a").getFirst();assertEquals(request.id(),route.id());assertEquals(a.player(),route.reservation().player());assertEquals(destination,route.reservation().destination());
         assertEquals("DISPATCHED",store.notices("a").getFirst().state());assertTrue(store.work("b").isEmpty());
-        assertEquals(4,events.history("tpa:"+a.player(),0,10).size());
+        assertTrue(events.history("tpa:"+a.player(),0,10).isEmpty());
         var saved=com.google.gson.JsonParser.parseString(new String(events.read("tpa:"+a.player()).orElseThrow().payload(),java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
         assertEquals("b",saved.getAsJsonObject("destination").get("node").getAsString());assertEquals(a.epoch(),saved.get("requesterEpoch").getAsLong());
     }
@@ -193,7 +463,7 @@ class DatabaseIntegrationTest {
         Session s=sessions.acquire(UUID.randomUUID(),"a");
         Transaction tx=change(s,UUID.randomUUID(),0,"diamond");
         assertFalse(events.commit(tx).duplicate());assertTrue(events.commit(tx).duplicate());
-        assertEquals(1,events.history("player:"+s.player(),0,10).size());
+        assertTrue(events.history("player:"+s.player(),0,10).isEmpty());
         assertThrows(ConflictException.class,() -> events.commit(change(s,tx.operation(),0,"gold")));
     }
     @Test void allParticipantsRollbackOnConflict() throws Exception {
@@ -233,10 +503,11 @@ class DatabaseIntegrationTest {
         assertThrows(ConflictException.class,() -> events.commit(change(s,UUID.randomUUID(),0,"bad")));
         Session next=sessions.acquire(s.player(),"b");assertEquals(s.epoch()+1,next.epoch());
     }
-    @Test void replayRestoresExactPayloadWithoutCallbacks() throws Exception {
+    @Test void newCommitsDoNotCreateReplayHistory() throws Exception {
         Session s=sessions.acquire(UUID.randomUUID(),"a");
         events.commit(change(s,UUID.randomUUID(),0,"one"));events.commit(change(s,UUID.randomUUID(),1,"two"));
-        assertArrayEquals("one".getBytes(),events.replay("player:"+s.player(),1).orElseThrow().payload());
+        assertTrue(events.replay("player:"+s.player(),1).isEmpty());
+        assertArrayEquals("two".getBytes(),events.read("player:"+s.player()).orElseThrow().payload());
         assertEquals(2,events.read("player:"+s.player()).orElseThrow().version());
     }
     @Test void concurrentWritersOnlyOneWinsExpectedVersion() throws Exception {
@@ -334,7 +605,7 @@ class DatabaseIntegrationTest {
             db.transaction(c -> {update(c,"UPDATE link_outbox SET delivered=false WHERE id=?",op);return null;});
             assertEquals(1,relay.flush(10));
         }
-        assertEquals(1,events.history("player:"+owner.player(),0,10).size());
+        assertTrue(events.history("player:"+owner.player(),0,10).isEmpty());
         assertArrayEquals("durable".getBytes(),events.read("player:"+owner.player()).orElseThrow().payload());
     }
     @Test void sqlFailureRollsBackEventAndSnapshotTogether() throws Exception {
@@ -489,6 +760,6 @@ class DatabaseIntegrationTest {
         assertThrows(ConflictException.class,()->events.commit(change(crashed,UUID.randomUUID(),1,"stale-destination")));
         if(boundary>=1)assertThrows(ConflictException.class,()->sessions.accept(player,operation,"b"));
         events.commit(change(recovered,UUID.randomUUID(),1,"seven-diamonds-recovered"));
-        assertEquals(2,events.history("player:"+player,0,10).size());
+        assertTrue(events.history("player:"+player,0,10).isEmpty());
     }
 }

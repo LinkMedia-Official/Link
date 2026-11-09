@@ -11,6 +11,9 @@ public final class Database implements AutoCloseable {
     @FunctionalInterface public interface Work<T> { T run(Connection connection) throws Exception; }
     private final Connections connections;
     private Runnable close=()->{};
+    private volatile java.util.function.Supplier<io.linkmc.api.LinkApi.Session> nodeOwner;
+    /** Backend-only fencing. Startup acquisition uses an unbound connection pool. */
+    public void nodeOwner(java.util.function.Supplier<io.linkmc.api.LinkApi.Session> owner){nodeOwner=Objects.requireNonNull(owner);}
     private WorldBlobs worldBlobs=new WorldBlobs(null);
     public WorldBlobs worldBlobs(){return worldBlobs;}
     public void worldStorage(WorldBlobs.Store store){worldBlobs=new WorldBlobs(store);}
@@ -32,7 +35,9 @@ public final class Database implements AutoCloseable {
         var db=new Database(pool::getConnection);db.close=pool::close;return db;
     }
     @Override public void close(){close.run();}
-    public <T> T transaction(Work<T> work) throws Exception {
+    public <T> T transaction(Work<T> work) throws Exception {return transaction(work,false);}
+    <T> T exclusiveNodeTransaction(Work<T> work)throws Exception{return transaction(work,true);}
+    private <T> T transaction(Work<T> work,boolean exclusiveNode)throws Exception {
         try (Connection c = connections.open()) {
             c.setAutoCommit(false);
             c.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
@@ -46,6 +51,14 @@ public final class Database implements AutoCloseable {
                     s.execute("SET LOCAL statement_timeout = '10s'");
                     s.execute("SET LOCAL lock_timeout = '5s'");
                     s.execute("SET LOCAL synchronous_commit = on");
+                    }
+                }
+                var owner=nodeOwner;
+                if(owner!=null){
+                    var session=Objects.requireNonNull(owner.get(),"Missing backend owner");
+                    if(exclusiveNode)lock(c,"node-startup:"+session.node());else sharedLock(c,"node-startup:"+session.node());
+                    try(var s=sql(c,"SELECT 1 FROM link_sessions WHERE player=? AND node=? AND epoch=? AND state='ACTIVE' AND expires_at>clock_timestamp()",session.player(),session.node(),session.epoch());var r=s.executeQuery()){
+                        if(!r.next())throw new ConflictException("Backend instance was replaced or its lease expired");
                     }
                 }
                 T result = work.run(c);
@@ -88,6 +101,18 @@ public final class Database implements AutoCloseable {
         try (PreparedStatement s = c.prepareStatement("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))")) {
             s.setString(1, "link:" + key); s.execute();
         }
+    }
+    /** Concurrent backend work may proceed together; a startup takeover waits for all of it. */
+    public static void sharedLock(Connection c,String key)throws SQLException{
+        if(maria(c)){
+            String hash;
+            try{hash=java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8)));}
+            catch(java.security.NoSuchAlgorithmException e){throw new SQLException(e);}
+            boolean exists;
+            try(var s=sql(c,"SELECT id FROM link_locks WHERE id=? LOCK IN SHARE MODE",hash);var r=s.executeQuery()){exists=r.next();}
+            if(!exists)update(c,"INSERT IGNORE INTO link_locks(id) VALUES (?)",hash);
+            try(var s=sql(c,"SELECT id FROM link_locks WHERE id=? LOCK IN SHARE MODE",hash);var r=s.executeQuery()){if(!r.next())throw new SQLException("Missing shared lock");}
+        }else try(var s=sql(c,"SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))","link:"+key)){s.execute();}
     }
     public static PreparedStatement sql(Connection c, String sql, Object... args) throws SQLException {
         PreparedStatement s = c.prepareStatement(maria(c)?MariaDialect.translate(sql):sql);

@@ -12,7 +12,9 @@ public final class ArrivalStore {
     private final NetworkStore network;
     public ArrivalStore(Database db) { this.db=db;sessions=new SessionStore(db,30);network=new NetworkStore(db); }
     public void issue(UUID ticket, Reservation reservation, UUID transfer) throws Exception {
-        db.transaction(c -> {
+        db.transaction(c -> {issue(c,ticket,reservation,transfer);return null;});
+    }
+    void issue(java.sql.Connection c,UUID ticket,Reservation reservation,UUID transfer)throws Exception{
             lock(c,"session:"+reservation.player());lock(c,"allocation");
             update(c,"UPDATE link_arrivals SET state='CANCELLED' WHERE player=? AND state='ISSUED' AND expires_at<=clock_timestamp()",reservation.player());
             try(var s=sql(c,"SELECT * FROM link_arrivals WHERE id=?",ticket);var r=s.executeQuery()) {
@@ -20,7 +22,7 @@ public final class ArrivalStore {
                     if(!r.getObject("player",UUID.class).equals(reservation.player()) || !r.getObject("reservation",UUID.class).equals(reservation.id()) || !Objects.equals(r.getObject("transfer",UUID.class),transfer))
                         throw new ConflictException("Arrival ID reused");
                     if(!r.getString("state").equals("ISSUED"))throw new ConflictException("Arrival no longer pending");
-                    return null;
+                    return;
                 }
             }
             try(var s=sql(c,"SELECT c.node FROM link_reservations r JOIN link_channels c ON c.id=r.channel WHERE r.id=? AND r.player=? AND r.state='RESERVED' AND r.expires_at>clock_timestamp() AND c.ready",reservation.id(),reservation.player());var r=s.executeQuery()) {
@@ -28,12 +30,11 @@ public final class ArrivalStore {
             }
             update(c,"INSERT INTO link_arrivals(id,player,reservation,transfer,node,state,expires_at) SELECT ?,?,?,?,?,'ISSUED',expires_at FROM link_reservations WHERE id=?",
                     ticket,reservation.player(),reservation.id(),transfer,reservation.destination().node(),reservation.id());
-            return null;
-        });
     }
     /** Single-use claim. The backend caches the returned result for its one connection. */
     public Arrival claim(UUID player,String node) throws Exception {
         return db.transaction(c -> {
+            sharedLock(c,"node-startup:"+node);
             lock(c,"session:"+player);
             try(var s=sql(c,"SELECT * FROM link_arrivals WHERE player=? AND state='ISSUED' AND expires_at>clock_timestamp() FOR UPDATE",player);var r=s.executeQuery()) {
                 if(!r.next() || !r.getString("node").equals(node))throw new ConflictException("No valid arrival for this backend");

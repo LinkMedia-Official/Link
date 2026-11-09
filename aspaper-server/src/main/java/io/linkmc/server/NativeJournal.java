@@ -12,7 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
 
-/** Serialized native execution frames. Failure is fail-stop, never an in-memory-only fallback. */
+/** In-memory gameplay with bounded asynchronous autosaves and explicit ownership-transfer barriers. */
 public final class NativeJournal {
     private static volatile NativeJournal instance;
     private static volatile Session startupLease;
@@ -21,15 +21,27 @@ public final class NativeJournal {
     public static synchronized void initializeEarly(){
         var config=LinkConfiguration.get();
         if(!config.mode().equals("journal")||enabled())return;
+        Database db=null;
+        startupLease=null;
         try{
             String node=config.node();
-            Database db=Database.pooled(config.jdbcUrl(),config.username(),config.password());db.worldStorage(config.worldStorage());db.migrate();
+            db=Database.pooled(config.jdbcUrl(),config.username(),config.password());db.worldStorage(config.worldStorage());db.migrate();
             SessionStore leases=new SessionStore(db,30);
-            startupLease=leases.acquire(UUID.nameUUIDFromBytes(("link-node:"+node).getBytes(StandardCharsets.UTF_8)),node);
+            startupLease=leases.acquireNode(node);
+            db.nodeOwner(()->startupLease);
             initialize(db,node,()->startupLease);
             startupRenewal=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon().name("Link-Startup-Lease").factory());
-            startupRenewal.scheduleWithFixedDelay(()->{try{startupLease=leases.renew(startupLease);}catch(Exception e){instance.poisoned=true;MinecraftServer.LOGGER.error("Link startup ownership lost",e);}},5,5,TimeUnit.SECONDS);
-        }catch(Exception e){throw new IllegalStateException("Cannot initialize durable native storage",e);}
+            startupRenewal.scheduleWithFixedDelay(()->{try{startupLease=leases.renew(startupLease);}catch(Exception e){fenceOwnership();MinecraftServer.LOGGER.error("Link startup ownership lost",e);}},5,5,TimeUnit.SECONDS);
+        }catch(Exception e){
+            finishStartup();
+            var journal=instance;instance=null;
+            if(journal!=null)try{journal.savePipeline.close();}catch(Exception cleanup){e.addSuppressed(cleanup);}
+            if(db!=null){
+                try{if(startupLease!=null)new SessionStore(db,30).releaseNode(startupLease);}catch(Exception cleanup){e.addSuppressed(cleanup);}
+                db.close();
+            }
+            throw new IllegalStateException("Cannot initialize durable native storage",e);
+        }
     }
     static Session startupOwner(){return startupLease;}
     static Database database(){return instance.db;}
@@ -37,6 +49,16 @@ public final class NativeJournal {
     private final Database db;
     private final EventStore store;
     private final FrameCommitter frames;
+    private final LinkChunkSnapshots chunkSnapshots=new LinkChunkSnapshots();
+    private final AsyncSavePipeline savePipeline=new AsyncSavePipeline(LinkConfiguration.get().saveWorkers());
+    private final long saveIntervalNanos=TimeUnit.SECONDS.toNanos(LinkConfiguration.get().saveIntervalSeconds());
+    private long nextSaveNanos;
+    private final SaveProgress saveProgress=new SaveProgress();
+    private CompletableFuture<Map<String,byte[]>> saving;
+    private List<Runnable> savedCompletions=List.of();
+    private List<java.util.function.Consumer<Throwable>> savedFailures=List.of();
+    private Set<UUID> savedDepartures=Set.of();
+    private record CapturedWorld(String key,com.infernalsuite.asp.api.world.SlimeWorld world) {}
     private final SessionStore sessions;
     private final ArrivalStore arrivals;
     private final String node;
@@ -48,6 +70,7 @@ public final class NativeJournal {
     private final Map<UUID,CompoundTag> playerData=new ConcurrentHashMap<>();
     private final Map<UUID,ServerPlayer> players=new ConcurrentHashMap<>();
     private final Set<UUID> departing=new HashSet<>();
+    private final Set<UUID> localTravel=new HashSet<>();
     private final Set<UUID> moving=ConcurrentHashMap.newKeySet();
     private final Set<UUID> queuedRoutes=ConcurrentHashMap.newKeySet();
     private final Map<String,net.minecraft.world.level.storage.SavedDataStorage> storages=new ConcurrentHashMap<>();
@@ -61,35 +84,40 @@ public final class NativeJournal {
     private volatile boolean poisoned;
     private volatile boolean active;
     private NativeJournal(Database db,String node,java.util.function.Supplier<Session> lease)throws Exception{
-        this.db=db;this.node=node;nodeLease=lease;store=new EventStore(db);frames=new FrameCommitter(store::commit);
+        this.db=db;this.node=node;nodeLease=lease;store=new EventStore(db);frames=new FrameCommitter(tx->{saveProgress.phase("sql",tx.changes().size());return store.commit(tx,saveProgress::advance);});
         sessions=new SessionStore(db,30);arrivals=new ArrivalStore(db);
         for(State state:store.prefix("native:"+node+"/")){frames.restore(state);restored.put(state.id(),state.payload());}
         String prefix="native:"+node+"/catalog/";
         restored.forEach((key,value)->{if(key.startsWith(prefix)&&value.length==1)catalog.put(key.substring(prefix.length()),value[0]);});
+        MinecraftServer.LOGGER.info("Link asynchronous storage: interval={}s, workers={}, maximum in-flight checkpoints=1",LinkConfiguration.get().saveIntervalSeconds(),LinkConfiguration.get().saveWorkers());
     }
     static void initialize(Database db,String node,java.util.function.Supplier<Session> lease)throws Exception{instance=new NativeJournal(db,node,lease);}
     public static boolean enabled(){return instance!=null;}
+    static void fenceOwnership(){var j=instance;if(j!=null)j.poisoned=true;}
     public static boolean moving(UUID player){return enabled()&&instance.moving.contains(player);}
     public static boolean runTask(java.util.function.BooleanSupplier task){
         boolean[] result={false};run(()->result[0]=task.getAsBoolean());return result[0];
     }
     public static void run(Runnable action){
         NativeJournal journal=instance;if(journal==null||!journal.active){action.run();return;}
-        if(!Bukkit.isPrimaryThread())throw new IllegalStateException("Native frame must run on the server thread");
+        if(!Bukkit.isPrimaryThread()){
+            if(MinecraftServer.getServer().hasStopped())return;
+            throw new IllegalStateException("Native frame must run on the server thread");
+        }
         // Shutdown drains scheduled tasks. Once fenced, discard their actions rather
         // than throwing from the drain and preventing the server's cleanup from running.
         if(journal.poisoned)return;
         boolean outer=journal.depth++==0;
-        if(outer)LinkPacketGate.begin();
         try{
+            if(outer)journal.finishSave(false);
             action.run();
             if(outer)journal.checkpoint();
         }catch(Throwable error){
             if(!journal.poisoned){
                 journal.poisoned=true;LinkPacketGate.abort(error);LinkRuntime.fence();finishStartup();
                 journal.requests.forEach(f->f.completeExceptionally(error));journal.requests.clear();
-                journal.failures.forEach(f->f.accept(error));journal.failures.clear();journal.completions.clear();
-                MinecraftServer.LOGGER.error("Link native frame failed; stopping without publishing or saving uncommitted state",error);
+                journal.failures.forEach(f->f.accept(error));journal.savedFailures.forEach(f->f.accept(error));journal.failures.clear();journal.completions.clear();
+                MinecraftServer.LOGGER.error("Link asynchronous save failed; stopping to preserve the last committed checkpoint",error);
                 MinecraftServer.getServer().halt(false);
             }
             if(error instanceof Error e)throw e;
@@ -97,7 +125,11 @@ public final class NativeJournal {
         }finally{journal.depth--;}
     }
     private void checkpoint()throws Exception{
-        LinkPacketGate.awaitEncoders();
+        finishSave(false);
+        if(saving!=null)return;
+        if(completions.isEmpty()&&departing.isEmpty()&&System.nanoTime()<nextSaveNanos)return;
+        List<CapturedWorld> capturedWorlds=new ArrayList<>();
+        Map<String,CompoundTag> tags=new TreeMap<>();
         var server=MinecraftServer.getServer();
         server.getScoreboard().storeToSaveDataIfDirty(server.getDataStorage().computeIfAbsent(net.minecraft.world.scores.ScoreboardSaveData.TYPE));
         List<Session> owners=new ArrayList<>();owners.add(nodeLease.get());
@@ -110,32 +142,71 @@ public final class NativeJournal {
             var slime=SlimeNMSBridge.instance().getInstance(world);
             if(slime==null)throw new IllegalStateException("Native journal only accepts slime worlds: "+world.getName());
             worldNames.add(world.getName());
-            byte[] bytes=AdvancedSlimePaperAPI.instance().getSerializer().serializeWorld(slime.getSerializableCopy());
-            BlobSnapshots.put(snapshots,worldKey(world.getName()),db.worldBlobs().encode(worldKey(world.getName()),bytes));
+            capturedWorlds.add(new CapturedWorld(worldKey(world.getName()),LinkChunkSnapshots.freeze((com.infernalsuite.asp.api.world.SlimeWorld)slime)));
         }
         Collections.sort(worldNames);snapshots.put("native:"+node+"/worlds",String.join("\n",worldNames).getBytes(StandardCharsets.UTF_8));
         catalog.forEach((name,state)->snapshots.put("native:"+node+"/catalog/"+name,new byte[]{state}));
         for(var storage:storages.entrySet())for(var entry:storage.getValue().linkSnapshot().entrySet()){
-            var output=new java.io.ByteArrayOutputStream();net.minecraft.nbt.NbtIo.writeCompressed(entry.getValue(),output);
-            snapshots.put(storage.getKey()+"/"+entry.getKey(),output.toByteArray());
+            tags.put(storage.getKey()+"/"+entry.getKey(),entry.getValue().copy());
         }
         for(var entry:players.entrySet()){
             if(moving.contains(entry.getKey()))continue;
             var admission=admitted.get(entry.getKey());if(admission==null)throw new IllegalStateException("Player without DB owner");
             owners.add(admission.session());
-            snapshots.put("player:"+entry.getKey(),NativePlayerCodec.encode(entry.getValue()));
+            tags.put("player:"+entry.getKey(),NativePlayerCodec.capture(entry.getValue()));
         }
-        frames.commit(owners,snapshots,LinkPacketGate::publish);
-        restored.putAll(snapshots);
+        Map<String,byte[]> previous=Map.copyOf(restored);
         storageMigrations.clear();
-        for(UUID id:List.copyOf(departing)){
-            var admission=admitted.remove(id);
-            if(admission!=null&&!moving.contains(id)){
-                new NetworkStore(db).depart(admission.session());sessions.release(admission.session());
-            }
-            players.remove(id);connections.remove(id);playerData.remove(id);moving.remove(id);departing.remove(id);
+        savedCompletions=List.copyOf(completions);completions.clear();
+        savedFailures=List.copyOf(failures);failures.clear();
+        savedDepartures=Set.copyOf(departing);
+        // Keep departing players registered until commit so heartbeat renewal cannot release ownership early.
+        departing.removeAll(savedDepartures);
+        nextSaveNanos=System.nanoTime()+saveIntervalNanos;
+        saveProgress.begin();
+        saving=savePipeline.submit(()->{
+            for(CapturedWorld world:capturedWorlds)chunkSnapshots.capture(world.world(),world.key(),db.worldBlobs(),previous,snapshots,savePipeline,saveProgress);
+            List<Callable<Map.Entry<String,byte[]>>> compression=new ArrayList<>();
+            tags.forEach((key,tag)->compression.add(()->Map.entry(key,NativePlayerCodec.compress(tag))));
+            saveProgress.phase("player-and-world-data",compression.size());
+            for(var value:savePipeline.parallel(compression,saveProgress::advance))snapshots.put(value.getKey(),value.getValue());
+            frames.commit(owners,snapshots,()->{});
+            return snapshots;
+        });
+    }
+    /** Completion runs on the server thread; workers never invoke Bukkit/plugin callbacks. */
+    private void finishSave(boolean wait)throws Exception{
+        if(saving==null)return;
+        if(!wait&&!saving.isDone()){
+            saveProgress.check(LinkConfiguration.get().saveStallSeconds(),LinkConfiguration.get().saveTimeoutSeconds());
+            if(saveProgress.reportDue())MinecraftServer.LOGGER.info("Link save in progress: {}",saveProgress.status());
+            return;
         }
-        List<Runnable> completed=List.copyOf(completions);completions.clear();failures.clear();completed.forEach(Runnable::run);
+        Map<String,byte[]> result=saveProgress.await(saving,LinkConfiguration.get().saveStallSeconds(),LinkConfiguration.get().saveTimeoutSeconds(),status->MinecraftServer.LOGGER.info("Link save in progress: {}",status));
+        if(wait)MinecraftServer.LOGGER.info("Link save completed: {}",saveProgress.status());
+        restored.putAll(result);saving=null;
+        List<Runnable> completed=savedCompletions;savedCompletions=List.of();savedFailures=List.of();
+        completed.forEach(Runnable::run);
+        for(UUID id:savedDepartures){
+            var admission=admitted.remove(id);
+            players.remove(id);connections.remove(id);playerData.remove(id);moving.remove(id);departing.remove(id);
+            // Publish RELEASED only after this backend has forgotten the old connection.
+            if(admission!=null)sessions.disconnect(admission.session());
+        }
+        savedDepartures=Set.of();
+
+    }
+    /** Explicit save / ownership hand-off barrier. Ordinary ticks never wait for storage. */
+    static void flush()throws Exception{
+        var j=instance;if(j==null)return;
+        if(!Bukkit.isPrimaryThread())throw new IllegalStateException("Capture must run on the server thread");
+        j.finishSave(true);j.nextSaveNanos=0;j.checkpoint();j.finishSave(true);
+    }
+    public static CompletableFuture<Void> saveAsync(){
+        var future=new CompletableFuture<Void>();
+        if(!watch(future))return future;
+        run(()->complete(future,null));
+        return future;
     }
     static <T> void complete(CompletableFuture<T> future,T value){
         NativeJournal j=instance;
@@ -148,7 +219,7 @@ public final class NativeJournal {
         if(j.poisoned){future.completeExceptionally(new IllegalStateException("Link journal fenced"));return false;}
         return true;
     }
-    static void activate(){if(instance.poisoned)throw new IllegalStateException("Startup lease was lost");instance.active=true;run(()->{});}
+    static void activate(){if(instance.poisoned)throw new IllegalStateException("Startup lease was lost");instance.active=true;run(()->{try{flush();}catch(Exception e){throw new IllegalStateException(e);}});}
     private synchronized String storageKey(java.nio.file.Path path){
         var normalized=path.toAbsolutePath().normalize();
         var worlds=java.nio.file.Path.of("link-saved-worlds").toAbsolutePath().normalize();
@@ -183,8 +254,8 @@ public final class NativeJournal {
     public static void registerStorage(net.minecraft.world.level.storage.SavedDataStorage storage,java.nio.file.Path path){if(enabled())instance.storages.put(instance.storageKey(path),storage);}
     private String worldKey(String name){return "native:"+node+"/world/"+name;}
     private static Optional<byte[]> snapshot(String name)throws Exception{
-        var stored=BlobSnapshots.get(instance.restored,instance.worldKey(name));
-        return stored.isEmpty()?Optional.empty():Optional.of(instance.db.worldBlobs().decode(stored.get()));
+        instance.finishSave(true);
+        return LinkChunkSnapshots.restore(name,instance.worldKey(name),instance.db.worldBlobs(),instance.restored);
     }
     static byte[] worldOrTemplate(String name,byte[] template)throws Exception{
         if(!enabled())return template;
@@ -227,9 +298,15 @@ public final class NativeJournal {
             if(saved.isPresent()){j.frames.restore(saved.get());j.playerData.put(player,NativePlayerCodec.decode(saved.get().payload()));}
         }catch(Exception e){
             var arrival=j.admitted.remove(player);j.connections.remove(player,connection);j.playerData.remove(player);
-            if(arrival!=null)try{new NetworkStore(j.db).depart(arrival.session());j.sessions.release(arrival.session());}catch(Exception cleanup){e.addSuppressed(cleanup);}
+            if(arrival!=null)try{j.sessions.disconnect(arrival.session());}catch(Exception cleanup){e.addSuppressed(cleanup);}
             throw new IllegalStateException("Link arrival rejected",e);
         }
+    }
+    /** Bukkit OfflinePlayer/pre-login reads see committed data without claiming a live session. */
+    public static Optional<CompoundTag> readPlayerData(UUID id){
+        var journal=instance;if(journal==null)return Optional.empty();
+        try{var state=journal.store.read("player:"+id);return state.isEmpty()?Optional.empty():Optional.of(NativePlayerCodec.decode(state.get().payload()));}
+        catch(Exception error){throw new IllegalStateException("Cannot read committed player data",error);}
     }
     public static Optional<CompoundTag> playerData(UUID id){
         if(!instance.admitted.containsKey(id))throw new IllegalStateException("Player data requested before arrival claim");
@@ -242,6 +319,7 @@ public final class NativeJournal {
         try{new TeleportStore(j.db).registerPlayer(player.getUUID(),player.getBukkitEntity().getName());}
         catch(Exception error){throw new IllegalStateException("Player directory registration failed",error);}
         CompoundTag tag=j.playerData.get(player.getUUID());if(tag!=null)NativePlayerCodec.recover(player,tag);
+        LinkUtilities.restoreFlight(player.getBukkitEntity());
     }
     public static void left(ServerPlayer player){if(enabled())instance.departing.add(player.getUUID());}
     public static com.google.gson.JsonElement stats(UUID id){
@@ -258,12 +336,16 @@ public final class NativeJournal {
         if(!enabled()||instance.poisoned)return;
         NativeJournal j=instance;
         for(var entry:List.copyOf(j.admitted.entrySet())){
-            if(j.moving.contains(entry.getKey()))continue;
+            if(j.moving.contains(entry.getKey())){
+                Connection source=j.connections.get(entry.getKey());
+                if(source!=null&&source.isConnected())j.sessions.renewMoving(entry.getValue().session());
+                continue;
+            }
             var old=entry.getValue();
             try{
                 Connection connection=j.connections.get(entry.getKey());
                 if(connection!=null&&!connection.isConnected()&&!j.players.containsKey(entry.getKey())){
-                    if(j.admitted.remove(entry.getKey(),old)){new NetworkStore(j.db).depart(old.session());j.sessions.release(old.session());j.connections.remove(entry.getKey());j.playerData.remove(entry.getKey());}
+                    if(j.admitted.remove(entry.getKey(),old)){j.connections.remove(entry.getKey(),connection);j.playerData.remove(entry.getKey());j.sessions.disconnect(old.session());}
                     continue;
                 }
                 Session renewed=j.sessions.renew(old.session());
@@ -274,7 +356,7 @@ public final class NativeJournal {
     }
     static void submitRoute(RouteStore.Request route){
         NativeJournal j=instance;
-        if(j==null||j.poisoned||!j.queuedRoutes.add(route.id()))return;
+        if(j==null||j.poisoned||LinkRuntime.isClosing()||!j.queuedRoutes.add(route.id()))return;
         try{
             MinecraftServer.getServer().execute(()->{
                 try{if(!j.poisoned)run(()->j.transfer(route));}
@@ -284,42 +366,53 @@ public final class NativeJournal {
     }
     private void transfer(RouteStore.Request route){
         UUID id=route.reservation().player();
-        if(moving.contains(id))return;
+        if(moving.contains(id)||localTravel.contains(id))return;
         ServerPlayer player=players.get(id);if(player==null)return;
+        var routes=new RouteStore(db);var admission=admitted.get(id);if(admission==null)return;
+        Session owner=admission.session();boolean local=route.reservation().destination().node().equals(node);
         try{
-            if(!new RouteStore(db).status(route.id()).equals("REQUESTED"))return;
+            if(!routes.status(route.id()).equals("REQUESTED"))return;
             if(player.getBukkitEntity().getPersistentDataContainer().has(LinkEditors.KEY,org.bukkit.persistence.PersistentDataType.STRING)){
-                new RouteStore(db).finish(route.id(),false);
-                new NetworkStore(db).cancel(route.reservation().id(),id);
-                player.getBukkitEntity().sendMessage("템플릿 편집 중에는 /템플릿 나가기로 복귀한 뒤 이동하세요.");
+                routes.reject(route);player.getBukkitEntity().sendMessage("템플릿 편집을 종료한 뒤 이동하세요.");return;
+            }
+            var d=route.reservation().destination();var world=local?Bukkit.getWorld(d.world()):null;
+            if(local&&world==null){routes.reject(route);player.getBukkitEntity().sendMessage("이동할 월드가 로드되지 않았습니다.");return;}
+            // Validate and claim before any gameplay mutation. Expected request conflicts are scoped to this route.
+            try{if(!routes.claim(route,owner))return;}
+            catch(ConflictException rejected){routes.reject(route);player.getBukkitEntity().sendMessage("이동 요청이 만료되었거나 이전 접속의 요청입니다. 다시 시도하세요.");return;}
+            player.closeContainer();player.stopRiding();
+            if(local){
+                localTravel.add(id);
+                if(!player.getBukkitEntity().teleport(new org.bukkit.Location(world,d.x(),d.y(),d.z(),d.yaw(),d.pitch()))){
+                    localTravel.remove(id);routes.reject(route);player.getBukkitEntity().sendMessage("플러그인이 이동을 취소했습니다.");return;
+                }
+                // Keep ACTIVE ownership and include the player in the post-teleport checkpoint.
+                completions.add(()->{try{
+                    Destination arrived=routes.completeLocal(route,owner);
+                    admitted.computeIfPresent(id,(key,current)->new ArrivalStore.Arrival(current.ticket(),current.session(),arrived));
+                }catch(Exception e){throw new IllegalStateException("Local route acknowledgement failed",e);}
+                finally{localTravel.remove(id);}});
                 return;
             }
-            player.closeContainer();player.stopRiding();
-            // Release all source gameplay changes before freezing its ownership.
-            checkpoint();LinkPacketGate.begin();
-            moving.add(id);
-            boolean local=route.reservation().destination().node().equals(node);
-            if(!local)player.level().removePlayerImmediately(player,net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_WITH_PLAYER);
-            sessions.prepare(admitted.get(id).session(),route.id(),route.reservation().destination());
-            arrivals.issue(route.id(),route.reservation(),route.id());
-            if(local){
-                var arrival=arrivals.claim(id,node);admitted.put(id,arrival);
-                var d=arrival.destination();var world=Objects.requireNonNull(Bukkit.getWorld(d.world()),"Missing local destination");
-                if(!player.getBukkitEntity().teleport(new org.bukkit.Location(world,d.x(),d.y(),d.z(),d.yaw(),d.pitch())))throw new IllegalStateException("Local warp rejected");
-                moving.remove(id);
-            }
-            // The proxy must not observe READY until the local destination/world
-            // removal frame has committed as well as the final source inventory.
-            completions.add(()->{try{
-                if(local)new RouteStore(db).finish(route.id(),true);
-                else new RouteStore(db).ready(route.id());
-            }catch(Exception e){throw new IllegalStateException("Route acknowledgement failed",e);}});
+            flush();moving.add(id);
+            try{routes.prepareRemote(route,owner);}
+            catch(ConflictException rejected){moving.remove(id);routes.reject(route);player.getBukkitEntity().sendMessage("서버 이동 요청이 만료되었습니다. 다시 시도하세요.");return;}
+            player.level().removePlayerImmediately(player,net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_WITH_PLAYER);
+            // READY follows the durable source removal checkpoint. Only Velocity opens the new connection.
+            completions.add(()->{try{routes.ready(route.id());}catch(Exception e){throw new IllegalStateException("Remote route acknowledgement failed",e);}});
         }catch(Exception e){throw new IllegalStateException("Transfer preparation failed",e);}
     }
     static void shutdown(){
         finishStartup();
         NativeJournal j=instance;if(j==null)return;
-        if(!j.poisoned&&Bukkit.isPrimaryThread())run(()->{});
-        instance=null;
+        try{
+            if(j.poisoned)throw new IllegalStateException("Backend ownership or checkpoint failed");
+            if(!Bukkit.isPrimaryThread())throw new IllegalStateException("Final checkpoint requires the server thread");
+            run(()->{try{flush();}catch(Exception e){throw new IllegalStateException(e);}});
+        }finally{
+            j.active=false;LinkRuntime.fence();
+            j.requests.forEach(f->f.completeExceptionally(new IllegalStateException("Backend stopped")));j.requests.clear();
+            try{j.savePipeline.close();}finally{instance=null;}
+        }
     }
 }

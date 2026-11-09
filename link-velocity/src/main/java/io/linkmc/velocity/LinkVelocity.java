@@ -19,7 +19,7 @@ import java.util.concurrent.*;
 /** Backend names in velocity.toml must equal LINK_NODE_ID; modern forwarding is required. */
 @Plugin(id="link",name="Link",version="0.1.0-SNAPSHOT",description="Link transactional backend routing")
 public final class LinkVelocity {
-    private record Pending(UUID ticket,Reservation reservation){}
+    private record Pending(UUID ticket,Reservation reservation,Player connection){}
     private final ProxyServer proxy;
     private final Logger logger;
     private final Path dataDirectory;
@@ -50,32 +50,39 @@ public final class LinkVelocity {
             try{worker.execute(()->{
                 Player player=event.getPlayer();
                 try{
+                    // A reconnect must wait for the old backend's final save/release, never steal its inventory.
+                    var sessions=new SessionStore(database,30);long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(15);
+                    while(!sessions.available(player.getUniqueId())){
+                        if(!player.isActive()||System.nanoTime()>=deadline)throw new ConflictException("Previous player session is still saving");
+                        Thread.sleep(100);
+                    }
+                    if(!player.isActive())throw new ConflictException("Connection closed during allocation");
                     UUID ticket=UUID.randomUUID();Reservation reservation=network.reserve(player.getUniqueId(),ticket);
-                    Pending request=new Pending(ticket,reservation);pending.put(player.getUniqueId(),request);
+                    Pending request=new Pending(ticket,reservation,player);pending.put(player.getUniqueId(),request);
                     var target=proxy.getServer(reservation.destination().node()).orElseThrow(()->new IllegalStateException("Unregistered Link backend"));
                     arrivals.issue(ticket,reservation,null);event.setInitialServer(target);
-                }catch(Exception e){logger.error("Link initial allocation failed",e);player.disconnect(Component.text("스폰을 준비하지 못했습니다. 잠시 후 다시 접속해 주세요."));cleanup(player.getUniqueId());}
+                }catch(Exception e){logger.error("Link initial allocation failed",e);player.disconnect(Component.text("스폰을 준비하지 못했습니다. 잠시 후 다시 접속해 주세요."));cleanup(player.getUniqueId(),player);}
                 finally{continuation.resume();}
             });}catch(RejectedExecutionException e){event.getPlayer().disconnect(Component.text("접속 요청이 많습니다. 잠시 후 다시 시도해 주세요."));continuation.resume();}
         });
     }
     @Subscribe(order=PostOrder.LAST) public void preConnect(ServerPreConnectEvent event){
         Pending request=pending.get(event.getPlayer().getUniqueId());
-        if(request==null||!request.reservation().destination().node().equals(event.getResult().getServer().map(s->s.getServerInfo().getName()).orElse(""))){
+        if(request==null||request.connection()!=event.getPlayer()||!request.reservation().destination().node().equals(event.getResult().getServer().map(s->s.getServerInfo().getName()).orElse(""))){
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
         }
     }
-    @Subscribe public void connected(ServerPostConnectEvent event){pending.remove(event.getPlayer().getUniqueId());travelling.remove(event.getPlayer().getUniqueId());}
+    @Subscribe public void connected(ServerPostConnectEvent event){pending.computeIfPresent(event.getPlayer().getUniqueId(),(id,p)->p.connection()==event.getPlayer()?null:p);travelling.remove(event.getPlayer().getUniqueId());}
     @Subscribe public void disconnected(DisconnectEvent event){
         travelling.remove(event.getPlayer().getUniqueId());
-        try{worker.execute(()->cleanup(event.getPlayer().getUniqueId()));}catch(RejectedExecutionException ignored){}
+        try{worker.execute(()->cleanup(event.getPlayer().getUniqueId(),event.getPlayer()));}catch(RejectedExecutionException ignored){}
     }
     private void dispatchReady()throws Exception{
         var players=proxy.getAllPlayers().stream().map(Player::getUniqueId).toList();
         for(var route:routes.readyFor(players)){
             Player player=proxy.getPlayer(route.reservation().player()).orElse(null);
             if(player==null||!player.isActive()||!routes.dispatch(route.id()))continue;
-            UUID id=player.getUniqueId();pending.put(id,new Pending(route.id(),route.reservation()));travelling.add(id);
+            UUID id=player.getUniqueId();pending.put(id,new Pending(route.id(),route.reservation(),player));travelling.add(id);
             try{
                 var target=proxy.getServer(route.reservation().destination().node()).orElseThrow(()->new IllegalStateException("Unregistered Link backend"));
                 if(player.getCurrentServer().map(s->s.getServerInfo().getName().equals(route.reservation().destination().node())).orElse(false)){
@@ -86,14 +93,14 @@ public final class LinkVelocity {
                     try{worker.execute(()->{try{routes.finish(route.id(),success);}catch(Exception e){logger.error("Route completion recording failed",e);}});}catch(RejectedExecutionException ignored){}
                     if(!success)player.disconnect(Component.text("서버 이동에 실패했습니다. 다시 접속해 주세요."));
                 });
-            }catch(Exception e){routes.finish(route.id(),false);cleanup(id);travelling.remove(id);player.disconnect(Component.text("서버 이동에 실패했습니다. 다시 접속해 주세요."));logger.error("Link route failed",e);}
+            }catch(Exception e){routes.finish(route.id(),false);cleanup(id,player);travelling.remove(id);player.disconnect(Component.text("서버 이동에 실패했습니다. 다시 접속해 주세요."));logger.error("Link route failed",e);}
         }
         for(var entry:List.copyOf(pending.entrySet()))if(entry.getValue().reservation().expiresAt().isBefore(java.time.Instant.now())){
-            proxy.getPlayer(entry.getKey()).ifPresent(p->p.disconnect(Component.text("이동 예약이 만료되었습니다. 다시 접속해 주세요.")));cleanup(entry.getKey());travelling.remove(entry.getKey());
+            entry.getValue().connection().disconnect(Component.text("이동 예약이 만료되었습니다. 다시 접속해 주세요."));cleanup(entry.getKey(),entry.getValue().connection());travelling.remove(entry.getKey());
         }
     }
-    private void cleanup(UUID id){
-        Pending request=pending.remove(id);if(request==null)return;
+    private void cleanup(UUID id,Player connection){
+        Pending request=pending.get(id);if(request==null||request.connection()!=connection||!pending.remove(id,request))return;
         try{routes.finish(request.ticket(),false);arrivals.cancel(request.ticket(),id);network.cancel(request.reservation().id(),id);}catch(Exception e){logger.warn("Arrival cleanup deferred until expiry",e);}
     }
     @Subscribe public void shutdown(ProxyShutdownEvent event){worker.shutdownNow();if(service!=null){RuntimeProvider.uninstall(service);service.close();}if(database!=null)database.close();}

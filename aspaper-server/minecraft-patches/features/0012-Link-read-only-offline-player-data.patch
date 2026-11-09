@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Link <link@localhost>
+Date: Sat, 7 Nov 2026 12:00:00 +0900
+Subject: [PATCH] Allow committed offline player reads before arrival ownership
+
+diff --git a/net/minecraft/world/level/storage/PlayerDataStorage.java b/net/minecraft/world/level/storage/PlayerDataStorage.java
+--- a/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -92,7 +92,7 @@ public class PlayerDataStorage {
+     }
+ 
+     public Optional<CompoundTag> load(final NameAndId nameAndId) {
+-        if (io.linkmc.server.NativeJournal.enabled()) return io.linkmc.server.NativeJournal.playerData(nameAndId.id());
++        if (io.linkmc.server.NativeJournal.enabled()) return io.linkmc.server.NativeJournal.readPlayerData(nameAndId.id());
+         Optional<CompoundTag> optTag = this.load(nameAndId, ".dat");
+         if (optTag.isEmpty()) {
+             this.backup(nameAndId, ".dat");

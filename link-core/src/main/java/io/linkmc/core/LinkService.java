@@ -11,6 +11,7 @@ public final class LinkService implements LinkApi, AutoCloseable {
     private final NetworkStore network;
     private final RouteStore routes;
     private final TeleportStore teleports;
+    private final WarpGroupStore groups;
     private final ExecutorService executor;
     private final java.util.function.Consumer<RouteStore.Request> routeSubmitted;
     public LinkService(Database database) {
@@ -20,7 +21,7 @@ public final class LinkService implements LinkApi, AutoCloseable {
         this.routeSubmitted=Objects.requireNonNull(routeSubmitted);
         events=new EventStore(database); sessions=new SessionStore(database,30); network=new NetworkStore(database);
         routes=new RouteStore(database);
-        teleports=new TeleportStore(database);
+        teleports=new TeleportStore(database);groups=new WarpGroupStore(database);
         // FIFO submission order within one runtime. Across runtimes, versions and
         // fencing reject stale work; callers must explicitly reconcile conflicts.
         executor=new ThreadPoolExecutor(1,1,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(1024),
@@ -37,7 +38,7 @@ public final class LinkService implements LinkApi, AutoCloseable {
     @Override public Data data() { return new Data() {
         public CompletionStage<Optional<State>> read(String id) { return async(() -> events.read(id)); }
         public CompletionStage<Commit> commit(Transaction tx) { return async(() -> {
-            if(tx.changes().stream().anyMatch(c->c.id().startsWith("native:")||c.id().startsWith("player:")||c.id().startsWith("warp:")||c.id().startsWith("tpa:")))
+            if(tx.changes().stream().anyMatch(c->c.id().startsWith("native:")||c.id().startsWith("player:")||c.id().startsWith("warp:")||c.id().startsWith("tpa:")||c.id().startsWith("group-request:")||c.id().startsWith("group-world:")))
                 throw new IllegalArgumentException("Reserved state: use engine().transact for native state or the network warp API");
             return events.commit(tx);
         }); }
@@ -74,6 +75,18 @@ public final class LinkService implements LinkApi, AutoCloseable {
         }
         return null;
     });}
+    @Override public WarpGroups warpGroups(){return new WarpGroups(){
+        public CompletionStage<Void> bind(String name,String template,int version,String node){return async(()->{groups.bind(name,template,version,node);return null;});}
+        public CompletionStage<List<WarpGroup>> list(){return async(groups::list);}
+        public CompletionStage<List<Channel>> channels(String name){return async(()->groups.channels(name));}
+        public CompletionStage<String> status(UUID id){return async(()->{String routed=routes.status(id);return routed.equals("MISSING")?groups.status(id):routed;});}
+        public CompletionStage<Void> travel(UUID player,UUID operation,String name){
+            return async(()->{if(groups.exists(name)){groups.enqueue(player,operation,name);return true;}return false;}).thenCompose(group->{
+                if(group)return CompletableFuture.completedFuture(null);
+                return network().warp(name).thenCompose(target->{if(target.isEmpty())return CompletableFuture.failedFuture(new ConflictException("Unknown warp"));return network().requestTravel(player,operation,target.get()).thenApply(r->null);});
+            });
+        }
+    };}
     @Override public Network network() { return new Network() {
         public CompletionStage<List<Channel>> channels() {return async(network::channels);}
         public CompletionStage<Void> registerChannel(String id,Destination spawn,int capacity){return async(()->{network.register(id,spawn,capacity);return null;});}
@@ -87,9 +100,7 @@ public final class LinkService implements LinkApi, AutoCloseable {
         public CompletionStage<Boolean> deleteWarp(String name){return async(()->network.deleteWarp(name));}
         public CompletionStage<List<String>> warps(){return async(network::warps);}
         public CompletionStage<Reservation> requestTravel(UUID player,UUID operation,Destination destination){return async(()->{
-            Reservation reservation=network.reserve(player,operation,destination);
-            try{routes.request(operation,reservation);}
-            catch(Exception error){try{network.cancel(operation,player);}catch(Exception cleanup){error.addSuppressed(cleanup);}throw error;}
+            Reservation reservation=routes.requestTravel(player,operation,destination);
             // This is a wake-up hint after durable submission. Polling remains the recovery path.
             try{routeSubmitted.accept(new RouteStore.Request(operation,reservation));}
             catch(RuntimeException ignored){}

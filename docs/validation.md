@@ -1,5 +1,53 @@
 # 검증 결과
 
+## 비동기 자동 저장·멀티스레드 검증 (2026-11-03)
+
+- PostgreSQL·MariaDB core 테스트 각각 75개 통과(전용 S3 통합 테스트 1개 제외), 서버 Link 테스트 92개 통과. 최종 linkDist 성공. 추가 NMS save-all 패치는 생성된 소스에 대한 reverse apply 검사를 통과했습니다.
+- 저장 파이프라인은 호출 스레드를 막지 않는 제출, 동시에 한 체크포인트만 허용, 3개 작업 스레드의 동시 처리 상한, 모든 작업 이후 커밋, 준비 실패 후 후속 커밋 거부를 검사했습니다. 독립 청크의 S3 동시 업로드와 동일 청크 캐시, 캡처 후 원본 월드 변경에도 복사본이 유지되는 검사, 설정 추가·범위 검사도 통과했습니다. SQL 커밋이 대기 중이어도 상태 조회와 다른 플레이어 상태 복원이 대기하지 않는 회귀 테스트를 추가했고, 최종 JAR로 월드 복구·명시적 저장을 재확인했습니다.
+- 실제 MariaDB + SlimeVault + Velocity + 두 백엔드에서 실행했습니다. A의 S3 요청에 테스트 프록시로 PUT당 3초 지연을 주고 4,096개 블록을 변경했습니다. 업로드 중 /list 응답은 Node/RCON 왕복 포함 약 72.4ms였고 PUT 요청 4개의 동시 처리를 확인했습니다.
+- 같은 시점의 jcmd 스레드 덤프에서 Link-Save-Worker 4개는 HTTP 응답을 기다렸고, Link-Save-Commit은 병렬 작업 완료를 기다렸으며, Server thread는 다음 틱을 기다리고 있었습니다. /save-all flush 성공 메시지는 저장 완료 후 기록됐습니다.
+- 이 로컬 시험에서 TPS 20.0, 최근 5초 평균 MSPT 1.2ms·최대 27.6ms를 관측했습니다. 해당 측정은 접속자 0명, A 월드 16개 및 테스트 강제 로드 청크 4개 조건이며 실제 운영 인원·WorldEdit/FAWE 부하 벤치마크가 아닙니다. 이후 유휴 백엔드 2개를 35초 관찰하여 link_operations 증가가 총 2건임을 확인했습니다.
+- 명시적 저장 성공 후 A를 강제 종료하고 B를 정상 종료했습니다. lease 만료 후 재시작하여 블록 4,096개·상자 아이템·아머 스탠드·PDC만 있는 빈 청크가 복구됐습니다. 재시작 전후 실제 클라이언트 A→Velocity→B 이동에서 인벤토리·엔더 상자·체력·경험치가 유지됐습니다. 재시작 후에는 아이템을 다시 지급하지 않았습니다. 검사 기간 새 이벤트 행은 0개였습니다.
+- 첫 지연 검사에서는 접속자가 없어 청크가 언로드되어 fill을 실행하지 못했습니다. 테스트 청크를 강제 로드하고 다시 검증한 뒤 해제했습니다. 첫 이동 검사에서는 목적지의 평화로움 난이도가 체력을 13에서 15로 회복시켜 테스트 플러그인의 고정값 검사가 서버를 중단했습니다. 양쪽 시험 월드를 보통 난이도로 고정한 후 같은 인벤토리·체력 검사를 통과했습니다.
+- 증거: build/async-tests.log, build/async-final-tests.log, build/async-read-lock-tests.log, build/async-maria-final.log, build/yaml-firstboot/async-final-smoke.stdout.log, build/async-live-check.log, build/async-thread-dump.txt, build/async-s3-proxy.stdout.log, build/async-idle-check.log, build/async-wire2.log, build/async-restart-wire.log, build/async-db-evidence.txt 및 async-crash-recovery/async-normal-recovery 서버 로그.
+- 일반 게임의 패킷은 DB 커밋을 기다리지 않습니다. 강제 종료 시 마지막 완료된 저장 이후 변경의 유실이 가능한 자동 저장 계약입니다. 저장 시점의 메인 스레드 캡처, 이동·종료의 최종 저장 대기, 기존 탑승 관계·지도 복구 한계는 남습니다. 과거 동기 저장 검사의 성능 수치를 새 구현의 성능으로 간주하지 않습니다.
+
+
+## 최신 상태 저장·청크 체크포인트 검증 (2026-11-03)
+
+- PostgreSQL·MariaDB core 테스트 각각 70개 통과(전용 S3 통합 테스트 1개 제외), 서버 Link 테스트 90개 통과. 설정 주석 변경 후 설정 테스트 10개 재확인, 최종 linkDist 빌드 성공.
+- 이벤트 INSERT를 DB 제약으로 금지해도 커밋·최신 상태 복구·중복 요청 처리가 성공했습니다. 기존 이벤트 삭제, 마지막 구형 이벤트 정리 후 현재 상태 유지, 정리 실패 롤백·동시 정리를 양쪽 DB에서 검사했습니다.
+- 청크 저장 테스트: PDC만 있는 빈 청크 보존, 한 청크 변경 시 다른 청크 기록 없음, 월드 설정 변경 시 청크 본문 기록 없음, 구형 전체 SRF의 원자적 전환, 필수 청크 손상 시 복구 거부, 재시작 후 불필요한 S3 객체 생성 없음.
+- 실제 MariaDB + SlimeVault + Velocity + 두 백엔드에서 구형 월드 19개(A 16개, B 3개)를 청크 형식으로 전환했습니다. 구형 native 월드 본문의 비어 있지 않은 상태 조각은 0개였고, 검사 시작 이후 새 link_events 행도 0개였습니다.
+- 서버 플러그인에서 4,096개 블록 변경, 상자 다이아몬드 13개, 장비를 가진 아머 스탠드, PDC만 있는 빈 청크를 저장했습니다. 빈 청크 언로드 후 확인하고, 커밋 완료 로그 뒤 A 프로세스를 강제 종료했습니다. lease 만료 후 재시작하여 모두 복구됐습니다. B는 정상 종료·재시작했습니다.
+- 실제 프로토콜 클라이언트의 A→Velocity→B 이동에서 인벤토리·엔더 상자·체력·경험치를 확인했습니다. 두 백엔드 재시작 후 아이템을 다시 지급하지 않고 접속·이동하여 같은 데이터가 유지됨을 재확인했습니다.
+- 증거: build/state-final-tests.log, build/state-maria-tests.log, build/state-config-build.log, build/state-wire.log, build/state-restart-wire.log, build/state-db-evidence.txt, build/yaml-firstboot/state-migration.stdout.log, build/yaml-firstboot/state-crash-recovery.stdout.log, build/tpa-backend-b/state-normal-recovery.stdout.log.
+- 실제 WorldEdit/FAWE 붙여넣기 비교 벤치마크나 51명 부하 재검사는 수행하지 않았습니다. 로드된 청크 전체의 내용 캡처·비교와 동기 SQL 비용은 남습니다. 강제 종료는 커밋 완료 후 주입했고, DB 자체 전원 손실·SQL/S3 동시 손실은 이번 검사 범위가 아닙니다. 탑승 관계·서버 간 지도 등 아래의 기존 한계는 해결됐다고 간주하지 않습니다.
+
+
+## 템플릿 채널 그룹·보호·동적 탭 검증 (2026-11-03)
+
+- PostgreSQL·MariaDB core 테스트 각각 68개 통과(전용 S3 통합 테스트 1개 제외), 버킷 Link 테스트 85개 통과, `linkDist` 성공.
+- DB 검사는 발행 정책 불변성, 고정 워프 이름 충돌, 채널당 정원·전체 최대 채널, 다른 노드로 증설, 생성 범위 제한, 8개 동시 증설 시 생성 작업 하나, 자동 증설 끄기, 요청 만료·재접속 epoch, outbox 오류 시 예약/라우트/요청 전체 롤백, 보관 정리 후 작업 UUID 재사용 방지를 포함합니다.
+- GUI 보호 정책 직렬화, 편집 세션에 한정된 우회, 일반 OP의 파괴·설치·상호작용 차단, 폭발 블록 목록 제거, 손상된 정책 차단, 채널 설정 범위와 동적 이름·버전·페이지를 테스트했습니다.
+- MariaDB + SlimeVault + Velocity + 두 백엔드에서 실제 클라이언트로 GUI 정원 1명·최대 2개·네트워크 전체 범위 및 7개 보호 항목을 설정하고 발행했습니다. 첫 요청은 같은 버킷에 채널 생성 후 이동했고, 두 번째 플레이어 요청은 다른 버킷에 채널을 생성해 서버 간 이동했습니다. 두 채널의 입장 인원은 각각 1명으로 확인했습니다.
+- 테스트 플러그인이 서버에서 Bukkit 파괴/설치 이벤트를 호출하여 편집 월드에서는 허용, 복제된 두 채널에서는 차단됨을 검증했습니다. 실제 클라이언트의 블록 파괴·설치 패킷을 전송한 검사는 아닙니다. 정상 재시작 후 기존 채널과 정책을 재사용하고 정확한 템플릿 스폰으로 이동했습니다.
+- 실제 DB의 그룹·워프·템플릿 버전·작업 월드·페이지 탭 추천 10건 통과. 페이지 검사를 위해 임시 고정 워프 24개를 로컬 테스트 DB에 넣고 검사 후 삭제했습니다.
+- 증거: `build/groups-final-test.log`, `build/groups-maria-verified.log`, `build/groups-completions-final.log`, `build/groups-live.log`, `build/groups-restart.log`, `build/groups-tab.log`. 런타임 이벤트 검사 로그는 `build/yaml-firstboot/groups-a.stdout.log`, `build/tpa-backend-b/groups-b.stdout.log`, `build/yaml-firstboot/groups-restart-a.stdout.log`입니다.
+- 서버 생성 도중 강제 종료·운영 규모 부하·모든 보호 이벤트의 실제 게임 플레이는 이번 검사에 포함하지 않았습니다. 기존 엔진 한계와 슬롯을 보유한 서버의 복구 대기 정책은 그대로이며 운영 서버에 배포하지 않았습니다.
+## 플레이어 유틸리티 검증 (2026-11-03)
+
+- 버킷 Link 테스트 79개 통과, `linkDist` 빌드 성공. 유틸리티 신규 테스트 9개는 속도 범위·기본값·소수, 이동 종류 선택, 비행/게임 모드 검사, 접속·사망·이동 중 거부, 허기 변경, 한국어/영어 인자와 탭, 커밋 후 응답·오류 비밀값 비노출, 명시적 비행 선택 복원을 포함합니다.
+- MariaDB + SlimeVault + Velocity 실제 접속에서 `/비행 켜기`, `/비행속도 3`, `/walkspeed 2`, `/회복`, `/feed`, 잘못된 `NaN`, 초기화 후 영어 속도 설정을 실행했습니다. 서버 측 검사로 비행·걷기 속도, 비행 권한/상태, 체력·허기를 확인했고 로그아웃/재접속 뒤 같은 상태를 다시 확인했습니다.
+- 실제 한국어·영어 명령의 숫자 대신 초기화/종류/비행 on/off 인자 탭 추천 6건 통과. 증거: `build/utilities-final-test.log`, `build/utilities-live.log`, `build/utilities-tab.log`, `build/yaml-firstboot/utilities.stdout.log`의 `UTILITY_STATE_VERIFIED` 2건.
+- 이 변경에 별도 SQL 스키마는 없습니다. 유틸리티의 서버 간 이동/강제 종료 장애 주입은 이번 검증에 포함하지 않았으며 기존 플레이어 저장·이동 경로를 사용합니다. 테스트 플러그인은 배포물에 포함하지 않았습니다.
+## 템플릿 설정 GUI 검증 (2026-11-03)
+
+- 버킷 Link 테스트 70개, PostgreSQL·MariaDB core 테스트 각각 61개 통과(전용 S3 통합 테스트 1개 제외). `linkDist` 빌드 성공.
+- GUI의 스폰 PDC 직렬화, 경계 검사, 잘못된 스폰 데이터 거부, Shift/숫자키/오프핸드/버리기/더블클릭/드래그 차단, 편집 월드·권한 재검증, 설정 명령 별칭·탭 추천을 검사했습니다. 자동 스폰 증설이 템플릿의 정확한 좌표·시선을 예약에 사용하는 것도 양쪽 DB에서 확인했습니다.
+- MariaDB + SlimeVault + Velocity 실제 프로토콜 클라이언트로 GUI 열기와 설정 버튼 12개를 클릭했습니다. 시간·날씨·규칙·난이도·경계·정확한 스폰 `(2.25,65,3.75,123,17)`을 서버 측 검사로 확인하고, 발행본 복제와 원본 재입장 후 동일 설정을 확인했습니다. 메뉴 아이템의 Shift/숫자키 회수 시도 후 플레이어 인벤토리·커서에 아이콘이 없는 것도 검사했습니다.
+- 정상 종료 후 소유권 임대가 만료된 다음 재시작하여 원본 설정 복원과 GUI의 저장 후 나가기 버튼을 확인했습니다. 즉시 재시작 시 남은 임대 때문에 첫 부팅이 거절됐고, 임대를 강제로 수정하지 않고 만료 후 재시도했습니다. 초기 테스트 스크립트의 콘솔 TP가 기본 월드로 이동시킨 문제는 플레이어의 현재 차원에서 TP하도록 수정했습니다.
+- 증거: `build/template-gui-test.log`, `build/template-gui-core.log`, `build/template-gui-final.log`, `build/gui-live-final.log`, `build/gui-restart.log`, `build/yaml-firstboot/gui-restart-ready.stdout.log`. 테스트 플러그인은 배포물에 포함하지 않았습니다. 강제 종료 장애 주입과 대규모 GUI 동시 사용 부하는 이번 검사 범위에 포함하지 않았습니다.
 ## DB 플레이어 티피 요청 검증 (2026-11-03)
 
 - PostgreSQL·MariaDB core 테스트 각각 60개 통과(전용 S3 통합 테스트 1개 제외), 버킷 Link 테스트 64개 통과, `linkDist` 성공.
@@ -179,3 +227,52 @@ SlimeVault `a346212c59910682c5440180ea8512e8050a0100`을 직접 빌드해 writer
 - 실제 MariaDB + SlimeVault 테스트 버킷에서 기본 60초 스케줄러가 과거 작업 3,540건의 이벤트 25,069행을 정리했습니다. 플레이어 현재 상태와 발행된 템플릿의 버전·payload SHA-256은 정리 전후 동일했습니다. 사용자 별도 운영 DB는 접속·변경하지 않았습니다.
 - 정리 후 버킷을 정상 종료·재시작해 월드 복구와 기동 완료, RCON 명령 응답을 확인했습니다(`build/yaml-firstboot/retention-restart.stdout.log`).
 - 증거: `build/retention-maria-test.log`, `build/retention-postgres-test.log`, `build/yaml-firstboot/retention-live.stdout.log`, `build/retention-live-before.tsv`, `build/retention-live-after.tsv`. 운영 DB 파일 크기의 물리적 축소나 16GB 부하에서의 정리 처리량은 검증하지 않았습니다.
+
+## 2026-11-04 node ownership takeover
+
+- PostgreSQL 17 and MariaDB 11.4: 80 core tests passed per database (one optional S3 integration test skipped); 92 Link server tests passed.
+- New coverage: immediate takeover of an active node; cancellation of old moving sessions; preservation of another node's session; stale renew/release rejection; full backend transaction fencing; parallel shared-lock transactions; takeover waiting for active transactions; bound shutdown release; concurrent startup epochs.
+- Local MariaDB/S3 runtime: started backend A as test-a (epoch 24), then a second backend on another port with the same ID (epoch 25). The old backend rejected SQL work and stopped on ownership loss. The replacement started and restored the previously saved chest. The old shutdown did not release epoch 25.
+- Graceful replacement shutdown immediately persisted RELEASED at epoch 25. Restart without a lease-expiry sleep acquired epoch 26 and reached ready state. No production database was accessed.
+- Forced replacement recovers completed checkpoints only, not unsaved memory. Same-ID instances are replacements, not independent servers.
+- Evidence: build/ownership-tests.log, build/ownership-maria.log, build/ownership-pg-final.log; build/yaml-firstboot/ownership-first.stdout.log; build/tpa-backend-b/ownership-takeover.stdout.log and ownership-restart.stdout.log.
+
+## 2026-11-04 lease lock-contention follow-up
+
+- Checkpoint validation keeps the session advisory lock but no longer locks the session row. Renewal takes only a short row lock and checks node/epoch/state/DB-clock expiry after acquiring it.
+- Transient SQL failures retry twice; expired/replaced ownership still fails closed. This avoids treating one recoverable lock timeout as immediate ownership loss without weakening takeover fencing.
+- Added regression tests for renewal during an active checkpoint guard, recovery after a 5-second row-lock timeout, rejection of already expired leases and rejection when expiry occurs while waiting for the row lock.
+- NMS patch 0011 stops teleport/group scheduling before plugin disable; late off-thread tasks during shutdown are discarded. The patch reverse-apply check passed.
+- Final verification: PostgreSQL 17 and MariaDB 11.4 each passed 84 core tests (one optional S3 test skipped). The 92 Link server tests passed. Final core expiry-wait changes were retested on both databases and included in the rebuilt distribution.
+- Live MariaDB/S3 backend test: held the node session row FOR UPDATE for 12 seconds; the server continued responding to RCON and retained epoch 27 ACTIVE with a valid lease after the lock was released. Explicit save followed immediately by shutdown completed; epoch 27 became RELEASED. No teleport polling/thread warning or final checkpoint failure appeared in this run. This is a local zero-player test, not a reproduction of the production plugin set.
+- Evidence: build/lease-contention-build.log, build/lease-contention-final-pg.log, build/lease-contention-final-maria.log, build/lease-contention-live-db.txt, build/yaml-firstboot/lease-contention-live.stdout.log.
+
+## 2026-11-04 large checkpoint lock exhaustion
+
+Removed per-state-key advisory locks and replaced read-then-unconditional-upsert with primary-key protected inserts and expected-version conditional updates. All writes, operation receipt and outbox remain atomic. SQL statements are reused and writes are sorted. This also removes the per-key lock and version-read round trips.
+
+PostgreSQL test configuration: max_locks_per_transaction=64, max_connections=100. Regression test inserts and updates 65,536 keys in single checkpoints, asserts exactly one advisory lock for the unguarded commit, checks duplicate-operation replay, and checks complete rollback after a late version conflict. Independent concurrent writers test both initial insertion and updates without session guards that would otherwise serialize them.
+
+Upgrade requires stopping all backends sharing the DB before replacing their JARs; old unconditional writers must not overlap with new conditional writers. No schema/data migration or link.yml change is required.
+
+Verification: 86 core tests passed on each of PostgreSQL 17 and MariaDB 11.4; one optional S3 integration test skipped per run. The maximum-size checkpoint and concurrent unguarded writer regressions passed on both databases. A local MariaDB/S3 backend loaded existing worlds, restored the saved chest, completed save-all and shut down cleanly with no checkpoint failure. This smoke test used zero players and does not measure production plugin performance. Evidence: build/bounded-locks-pg.log, build/bounded-locks-maria.log and build/yaml-firstboot/bounded-locks-live.stdout.log.
+
+## 2026-11-05 progressing saves beyond 120 seconds
+
+- Replaced the fixed 120-second future wait with monotonic stall and total deadlines, shared by tick polling and synchronous startup/shutdown barriers. New link.yml defaults: stall-timeout-seconds=120, total-timeout-seconds=1800; existing saving sections receive missing keys automatically.
+- Added 10-second phase/completion/elapsed/idle logs; chunk completion and successful SQL state writes advance progress. Storage exceptions still fail immediately. Unchanged restored SlimeVault chunks compare embedded SHA-256 digests without a second download; restore still verifies downloaded content.
+- PostgreSQL and MariaDB: 91 core tests passed each, one optional S3 integration test skipped. Server: 93 Link tests passed. Includes 65,536-state commits, virtual-clock 300-second progress, stall/absolute deadlines, error propagation, checksum comparison without GET and existing-YAML migration.
+- Live local MariaDB/S3 test: forced 64 chunks and placed 16,384 stone blocks. Test proxy delayed each PUT by 3 seconds. Logs showed elapsed=130, 140, 150 and 160 seconds with increasing completed counts; RCON still responded. Delay was then removed and the explicit save completed at about 170 seconds. Restart verified stone at both ends of the region; test blocks and force-load flags were cleaned up, and final shutdown saved successfully. The next startup checkpoint completed in 2 seconds; total startup was about 19 seconds. Zero players, no production plugin performance claim.
+- Docker was initially stopped; the first DB test attempt failed to connect. After Docker startup, final PostgreSQL/MariaDB runs passed. Evidence: build/save-progress-pg-final.log, build/save-progress-maria.log, build/yaml-firstboot/save-progress-live.stdout.log, build/yaml-firstboot/save-progress-restart.stdout.log and build/progress-proxy.stdout.log.
+
+
+## 2026-11-07 travel ownership and pre-login reads
+
+- Same-backend routes retain ACTIVE ownership/epoch, use Bukkit teleport cancellation, and acknowledge admission after the player checkpoint. Durable route receipts claim each operation once and replay the original reservation even after completion/reconnect. Remote transfer preparation and arrival issuance share one SQL transaction; READY follows the source removal checkpoint. Connected frozen sources renew their MOVING lease while saving; an accepted destination epoch cannot be renewed/released by the old source.
+- Disconnect removes the old backend connection/cache before publishing RELEASED. Velocity waits up to 15 seconds for the previous session, associates pending cleanup with the actual proxy connection, and never steals active inventory. Expired crashed-source ownership reaps pinned reservations before reconnect allocation.
+- OfflinePlayer NBT reads use the latest committed DB snapshot without claiming a session. Actual PlayerList login still uses the ownership-gated path. Patch 0012 applies to the NMS PlayerDataStorage read path.
+- Final PostgreSQL 17 and MariaDB 11.4 runs: 96 core tests passed per database; one optional S3 test skipped. Server: 98 Link tests passed. New cases cover local epoch preservation, duplicate receipt replay after reconnect, eight concurrent claims, atomic remote rollback, accepted-destination protection, pending-transfer disconnect cancellation, MOVING renewal and expired-source reservation cleanup.
+- Actual local MariaDB/S3 backends test-a/test-b plus Velocity 4.3.1 and protocol client: cancelled local teleport isolated to FAILED; same-world local travel; same-backend cross-world travel; /spawn; A-to-B transfer; eight submissions sharing one UUID plus replay after completion; three immediate disconnect/reconnect cycles. Verified seven diamonds, three ender-chest emeralds, level 9 and health 13. Local epoch stayed 64; remote acceptance advanced it to 65; reconnects advanced to 66, 67 and 68. Final session RELEASED, zero reservations and zero pending routes. AsyncPlayerPreLoginEvent probe called OfflinePlayer.getName/getFirstPlayed/getLastPlayed successfully on both backends and repeated login.
+- Scope: the exact Bukkit pre-login access pattern behind the BetonQuest error was reproduced; the user's BetonQuest JAR/quest pack was not installed, so full quest behavior is not claimed. No production DB was accessed and this is not a production load benchmark.
+- Test fixture corrections: an initial cross-world run entered a peaceful test world and regenerated health to 14, causing the strict test assertion to abort that disposable backend. All test worlds were then set to NORMAL. A second run hit Velocity's default login-rate limit on repeated logins; the final run kept each connection open at least 3.2 seconds, then reconnected immediately after disconnect, without changing proxy rate limits. Final run had no Link ownership/checkpoint/pre-login failures. Windows OSHI performance-counter and upstream version-fetch warnings are unrelated environment warnings.
+- Evidence: build/travel-final-pg.log, build/travel-final-maria.log, build/travel-final-build.log, build/travel-wire-pass.log, build/yaml-firstboot/travel-a2.stdout.log, build/tpa-backend-b/travel-b2.stdout.log. Backend SHA-256 67183E84142C701BDF06F5B85E6AEE6CD0B3BCD6C921296D4A7675A8A816E257 matched both tested backend copies and the distribution.

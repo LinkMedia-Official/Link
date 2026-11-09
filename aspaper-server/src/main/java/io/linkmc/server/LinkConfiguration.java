@@ -14,6 +14,7 @@ public final class LinkConfiguration {
     private final String storage,endpoint,region,bucket,prefix,accessKey,secretKey;
     private final boolean retentionEnabled;
     private final int retentionHours,retentionInterval,retentionBatch,retentionBatches;
+    private final int saveIntervalSeconds,saveWorkers,saveStallSeconds,saveTimeoutSeconds;
     public static synchronized LinkConfiguration get(){
         if(instance==null)instance=load(Path.of("link.yml"),System.getenv(),System.getProperties());
         return instance;
@@ -24,6 +25,13 @@ public final class LinkConfiguration {
             var yaml=new YamlConfiguration();yaml.load(file.toFile());
             var config=new LinkConfiguration(yaml,environment,properties);
             if(!yaml.contains("retention"))Files.writeString(file,"\n"+RETENTION_DEFAULTS,StandardOpenOption.APPEND);
+            if(!yaml.contains("saving"))Files.writeString(file,"\n"+SAVING_DEFAULTS,StandardOpenOption.APPEND);
+            if(yaml.contains("saving")&&(!yaml.contains("saving.stall-timeout-seconds")||!yaml.contains("saving.total-timeout-seconds"))){
+                yaml.load(file.toFile());
+                if(!yaml.contains("saving.stall-timeout-seconds"))yaml.set("saving.stall-timeout-seconds",120);
+                if(!yaml.contains("saving.total-timeout-seconds"))yaml.set("saving.total-timeout-seconds",1800);
+                yaml.save(file.toFile());
+            }
             return config;
         }catch(IOException|org.bukkit.configuration.InvalidConfigurationException e){
             // Parser errors may quote the line containing a password.
@@ -60,6 +68,11 @@ public final class LinkConfiguration {
         retentionInterval=bounded(yaml,"retention.interval-seconds",60,10,86400);
         retentionBatch=bounded(yaml,"retention.batch-operations",500,1,1000);
         retentionBatches=bounded(yaml,"retention.max-batches",10,1,100);
+        saveIntervalSeconds=bounded(yaml,"saving.interval-seconds",30,1,3600);
+        saveWorkers=bounded(yaml,"saving.workers",4,1,16);
+        saveStallSeconds=bounded(yaml,"saving.stall-timeout-seconds",120,10,3600);
+        saveTimeoutSeconds=bounded(yaml,"saving.total-timeout-seconds",1800,30,86400);
+        if(saveTimeoutSeconds<saveStallSeconds)throw new IllegalArgumentException("saving.total-timeout-seconds must be >= stall timeout");
         io.linkmc.api.LinkApi.requireName(node);io.linkmc.api.LinkApi.requireName(template);
         if(mode.equals("journal")||mode.equals("tools")){
             if((!jdbcUrl.startsWith("jdbc:postgresql:")&&!jdbcUrl.startsWith("jdbc:mariadb:"))||username.isBlank()||password.isBlank())
@@ -82,6 +95,10 @@ public final class LinkConfiguration {
         throw new IllegalArgumentException(key+" must be an integer between "+minimum+" and "+maximum);
     }
     public boolean retentionEnabled(){return retentionEnabled;}
+    public int saveIntervalSeconds(){return saveIntervalSeconds;}
+    public int saveWorkers(){return saveWorkers;}
+    public int saveStallSeconds(){return saveStallSeconds;}
+    public int saveTimeoutSeconds(){return saveTimeoutSeconds;}
     public int retentionHours(){return retentionHours;}
     public int retentionInterval(){return retentionInterval;}
     public int retentionBatch(){return retentionBatch;}
@@ -99,9 +116,18 @@ public final class LinkConfiguration {
     public io.linkmc.core.WorldBlobs.Store worldStorage(){
         return storage.equals("database")?null:new io.linkmc.core.SlimeVaultStore(endpoint,region,bucket,prefix,accessKey,secretKey);
     }
+    private static final String SAVING_DEFAULTS="""
+        # Gameplay runs in memory. A crash can lose changes after the last completed save.
+        # Main-thread snapshot, parallel encoding/uploads, ordered SQL commit.
+        saving:
+          interval-seconds: 30
+          workers: 4
+          stall-timeout-seconds: 120
+          total-timeout-seconds: 1800
+        """;
     private static final String RETENTION_DEFAULTS="""
-        # Deletes old event history, retaining current state and latest transaction anchors.
-        # Older historical rollback is unavailable after pruning. Restart after editing.
+        # Deletes legacy event history; new commits store current state only.
+        # Current state and idempotency receipts are retained. Restart after editing.
         retention:
           enabled: true
           event-hours: 24
@@ -140,5 +166,5 @@ public final class LinkConfiguration {
           version: 1
           capacity: 50
           max-worlds: 3
-        """+RETENTION_DEFAULTS;
+        """+RETENTION_DEFAULTS+SAVING_DEFAULTS;
 }

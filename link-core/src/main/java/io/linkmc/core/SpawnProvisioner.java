@@ -19,6 +19,10 @@ public final class SpawnProvisioner {
     }
     /** Call on a background control executor, not a tick thread. No unbounded world creation. */
     public CompletionStage<Boolean> ensureSpare(double x,double y,double z,float yaw,float pitch){
+        return ensureSpare(name->CompletableFuture.completedFuture(new Destination(node,name,x,y,z,yaw,pitch)));
+    }
+    public CompletionStage<Boolean> ensureSpare(){return ensureSpare(worlds::spawn);}
+    private CompletionStage<Boolean> ensureSpare(java.util.function.Function<String,CompletionStage<Destination>> spawn){
         if(!creating.compareAndSet(false,true))return CompletableFuture.completedFuture(false);
         try {
             var local=network.spawnChannels().stream().filter(c -> c.node().equals(node)).toList();
@@ -26,8 +30,8 @@ public final class SpawnProvisioner {
                 creating.set(false);return CompletableFuture.completedFuture(false);
             }
             String name="spawn-"+UUID.randomUUID();
-            return worlds.create(name,template,version,false).thenApplyAsync(info -> {
-                try {network.register(node+":"+name,new Destination(node,name,x,y,z,yaw,pitch),capacity);return true;}
+            return worlds.create(name,template,version,false).thenCompose(info->spawn.apply(name)).thenApplyAsync(destination -> {
+                try {network.register(node+":"+name,destination,capacity);return true;}
                 catch(Exception e){worlds.unload(name);throw new CompletionException(e);}
             }).whenComplete((v,e) -> creating.set(false));
         } catch(Exception e){creating.set(false);return CompletableFuture.failedFuture(e);}

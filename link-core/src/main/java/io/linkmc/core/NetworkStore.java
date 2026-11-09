@@ -65,7 +65,10 @@ public final class NetworkStore {
         return reserve(player,request,null);
     }
     public Reservation reserve(UUID player, UUID request, Destination target) throws Exception {
-        return db.transaction(c -> {
+        return db.transaction(c->reserve(c,player,request,target,null));
+    }
+    Reservation reserveGroup(Connection c,UUID player,UUID request,String group)throws Exception{return reserve(c,player,request,null,group);}
+    Reservation reserve(Connection c,UUID player,UUID request,Destination target,String group)throws Exception {
             lock(c,"allocation");
             // Idempotent retries return the same destination; no extra slot is consumed.
             try(var s=sql(c,"SELECT r.*,c.node,c.world,c.x,c.y,c.z,c.yaw,c.pitch,r.expires_at>clock_timestamp() AS valid FROM link_reservations r JOIN link_channels c ON c.id=r.channel WHERE r.id=?",request); var r=s.executeQuery()) {
@@ -74,6 +77,7 @@ public final class NetworkStore {
                     if(!r.getString("state").equals("RESERVED")) throw new ConflictException("Already admitted");
                     if(!r.getBoolean("valid")) throw new ConflictException("Reservation expired");
                     if(target!=null&&!reservation(r).destination().equals(target))throw new ConflictException("Reservation destination changed");
+                    if(group!=null){try(var check=sql(c,"SELECT 1 FROM link_group_worlds WHERE id=? AND group_name=?",r.getString("channel"),group);var found=check.executeQuery()){if(!found.next())throw new ConflictException("Reservation group changed");}}
                     return reservation(r);
                 }
             }
@@ -85,10 +89,11 @@ public final class NetworkStore {
             }
             String query="SELECT c.* FROM link_channels c JOIN link_nodes n ON n.id=c.node WHERE c.ready AND n.heartbeat>clock_timestamp()-interval '15 seconds' AND (SELECT count(DISTINCT r.player) FROM link_reservations r WHERE r.channel=c.id AND r.player<>?)<c.capacity AND (SELECT count(DISTINCT r.player) FROM link_reservations r JOIN link_channels nc ON nc.id=r.channel WHERE nc.node=c.node AND r.player<>?)<n.capacity ORDER BY (SELECT count(*) FROM link_reservations r WHERE r.channel=c.id) DESC,c.id LIMIT 1";
             if(target!=null)query=query.replace("WHERE c.ready AND", "WHERE c.node=? AND c.world=? AND c.ready AND");
+            else if(group!=null)query=query.replace("WHERE c.ready AND", "WHERE EXISTS(SELECT 1 FROM link_group_worlds gw WHERE gw.id=c.id AND gw.group_name=? AND gw.state='READY') AND c.ready AND");
             else query=query.replace("WHERE c.ready AND", "WHERE c.spawn_enabled AND c.ready AND");
             // Existing players prefer their current backend; first admission still balances normally.
             if(target==null)query=query.replace("ORDER BY (SELECT", "ORDER BY CASE WHEN c.node=(SELECT node FROM link_sessions WHERE player=? AND state='ACTIVE' AND expires_at>clock_timestamp()) THEN 0 ELSE 1 END, (SELECT");
-            try(var s=target==null?sql(c,query,player,player,player):sql(c,query,target.node(),target.world(),player,player); var r=s.executeQuery()) {
+            try(var s=target!=null?sql(c,query,target.node(),target.world(),player,player):group!=null?sql(c,query,group,player,player,player):sql(c,query,player,player,player); var r=s.executeQuery()) {
                 if(!r.next()) throw new ConflictException("NO_CAPACITY: provision a ready spawn before retrying");
                 String channel=r.getString("id");
                 Destination destination=target!=null?target:new Destination(r.getString("node"),r.getString("world"),r.getDouble("x"),r.getDouble("y"),r.getDouble("z"),r.getFloat("yaw"),r.getFloat("pitch"));
@@ -96,7 +101,7 @@ public final class NetworkStore {
                     expiry.next(); return new Reservation(request,player,channel,destination,instant(expiry,1));
                 }
             }
-        });
+
     }
     public Destination admit(UUID reservation, Session owner) throws Exception {
         return db.transaction(c -> admit(c,reservation,owner));
@@ -143,6 +148,7 @@ public final class NetworkStore {
         if(capacity<0)throw new IllegalArgumentException("Invalid capacity");
         db.transaction(c->{
             lock(c,"warp:"+name);
+            try(var check=sql(c,"SELECT 1 FROM link_warp_groups WHERE name=?",name);var row=check.executeQuery()){if(row.next())throw new ConflictException("Warp name belongs to a template group");}
             if(capacity>0){
                 lock(c,"allocation");
                 boolean exists;
@@ -156,7 +162,7 @@ public final class NetworkStore {
             update(c,"INSERT INTO link_warps(name,node,world,x,y,z,yaw,pitch) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET node=excluded.node,world=excluded.world,x=excluded.x,y=excluded.y,z=excluded.z,yaw=excluded.yaw,pitch=excluded.pitch",name,d.node(),d.world(),d.x(),d.y(),d.z(),d.yaw(),d.pitch());return null;
         });
     }
-    private void recordWarp(Connection c,String name,byte[] value,String type)throws Exception{
+    void recordWarp(Connection c,String name,byte[] value,String type)throws Exception{
         String id=LinkApi.warpStateId(name);long version=EventStore.read(c,id).map(State::version).orElse(0L);
         new EventStore(db).commit(c,new Transaction(UUID.randomUUID(),List.of(),List.of(new Change(id,version,1,type,value))));
     }
@@ -164,12 +170,15 @@ public final class NetworkStore {
         LinkApi.requireName(name);
         return db.transaction(c->{
             lock(c,"warp:"+name);
-            if(update(c,"DELETE FROM link_warps WHERE name=?",name)==0)return false;
+            lock(c,"allocation");
+            int deleted=update(c,"DELETE FROM link_warps WHERE name=?",name);
+            deleted+=update(c,"DELETE FROM link_warp_groups WHERE name=?",name);
+            if(deleted==0)return false;
             recordWarp(c,name,new byte[0],"warp:delete");return true;
         });
     }
     public List<String> warps()throws Exception{
-        return db.transaction(c->{List<String> names=new ArrayList<>();try(var s=sql(c,"SELECT name FROM link_warps ORDER BY name");var r=s.executeQuery()){while(r.next())names.add(r.getString(1));}return List.copyOf(names);});
+        return db.transaction(c->{List<String> names=new ArrayList<>();try(var s=sql(c,"SELECT name FROM link_warps UNION SELECT name FROM link_warp_groups ORDER BY name");var r=s.executeQuery()){while(r.next())names.add(r.getString(1));}return List.copyOf(names);});
     }
     public void syncWarpWorlds(String node,Collection<String> loaded)throws Exception{
         db.transaction(c->{lock(c,"allocation");try(var s=sql(c,"SELECT id,world,ready FROM link_channels WHERE node=? AND NOT spawn_enabled",node);var r=s.executeQuery()){

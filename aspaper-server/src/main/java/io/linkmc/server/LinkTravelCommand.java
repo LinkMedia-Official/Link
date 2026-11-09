@@ -19,6 +19,7 @@ final class LinkTravelCommand extends Command {
     private final Consumer<Runnable> dispatch;
     private final Consumer<Throwable> logError;
     private LinkCompletions completions;
+    private LinkApi.WarpGroups groups;
 
     LinkTravelCommand(String name, LinkApi.Network network, boolean journal,
                       Consumer<Runnable> dispatch, Consumer<Throwable> logError) {
@@ -38,7 +39,7 @@ final class LinkTravelCommand extends Command {
             var command=new LinkTravelCommand(name, api.network(), NativeJournal.enabled(),
                 task -> net.minecraft.server.MinecraftServer.getServer().execute(task),
                 error -> net.minecraft.server.MinecraftServer.LOGGER.error("Link travel request failed", error));
-            command.completions=completions;
+            command.completions=completions;command.groups=api.warpGroups();
             server.getCommandMap().register("link", command);
         }
     }
@@ -58,6 +59,12 @@ final class LinkTravelCommand extends Command {
             return true;
         }
         UUID id = player.getUniqueId();
+        if(getName().equals("warp")&&groups!=null){
+            groups.travel(id,UUID.randomUUID(),args[0]).whenComplete((v,e)->dispatch.accept(()->{
+                if(e!=null){logError.accept(e);if(player.isOnline())player.sendMessage("워프 요청에 실패했습니다. 이름 또는 진행 중인 이동을 확인하세요.");}
+                else if(player.isOnline())player.sendMessage("워프 이동을 요청했습니다. 채널 생성이 필요하면 최대 60초 동안 기다립니다.");
+            }));return true;
+        }
         CompletionStage<LinkApi.Destination> destination = getName().equals("spawn")
             ? CompletableFuture.completedFuture(null)
             : network.warp(args[0]).thenApply(found -> found.orElse(null));

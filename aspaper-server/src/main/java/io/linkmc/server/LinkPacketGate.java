@@ -8,7 +8,8 @@ import java.util.concurrent.*;
 /** Holds already encoded bytes, not mutable Packet/ItemStack objects. */
 public final class LinkPacketGate extends ChannelOutboundHandlerAdapter {
     private final boolean enabled;
-    public LinkPacketGate(){this(NativeJournal.enabled());}
+    // Autosave mode publishes gameplay immediately. Explicit API save futures acknowledge SQL durability.
+    public LinkPacketGate(){this(false);}
     LinkPacketGate(boolean enabled){this.enabled=enabled;}
     private record Write(ChannelHandlerContext context,Object message,ChannelPromise promise) {}
     private static final Set<ChannelHandlerContext> CONTEXTS=ConcurrentHashMap.newKeySet();

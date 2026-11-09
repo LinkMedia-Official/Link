@@ -24,15 +24,20 @@ public final class LinkWorldDriver implements WorldService.Driver {
     private final NetworkStore network;
     private final Map<String,Boolean> managed=new ConcurrentHashMap<>();
     private final Map<String,Long> versions=new ConcurrentHashMap<>();
+    List<String> editableNames(){return managed.entrySet().stream().filter(Map.Entry::getValue).map(Map.Entry::getKey).toList();}
     List<String> loadedNames(){return List.copyOf(managed.keySet());}
     public LinkWorldDriver(EventStore store,Session guard,String node,WorldBlobs blobs,NetworkStore network){this.store=store;this.guard=guard;this.node=node;this.blobs=blobs;this.network=network;}
     private String key(String name){io.linkmc.api.LinkApi.requireName(name);return "world:"+node+"/"+name;}
     static <T> T main(Callable<T> task) throws Exception {
+        return main(task,true);
+    }
+    private static <T> T readMain(Callable<T> task)throws Exception{return main(task,false);}
+    private static <T> T main(Callable<T> task,boolean durable) throws Exception {
         if(Bukkit.isPrimaryThread())return task.call();
         if(MinecraftServer.getServer().isStopped())throw new IllegalStateException("Server stopped before world operation could run");
         var future=new CompletableFuture<T>();
         if(!NativeJournal.watch(future))return future.get();
-        MinecraftServer.getServer().execute(() -> {if(future.isCancelled())return;try{NativeJournal.complete(future,task.call());}catch(Throwable e){future.completeExceptionally(e);if(NativeJournal.enabled()&&!(e instanceof ConflictException)&&!(e instanceof IllegalArgumentException))throw new IllegalStateException("World operation failed",e);}});
+        MinecraftServer.getServer().execute(() -> {if(future.isCancelled())return;try{T value=task.call();if(durable)NativeJournal.complete(future,value);else future.complete(value);}catch(Throwable e){future.completeExceptionally(e);if(NativeJournal.enabled()&&!(e instanceof ConflictException)&&!(e instanceof IllegalArgumentException))throw new IllegalStateException("World operation failed",e);}});
         // No timeout: otherwise a timed-out operation might still create a world later.
         try{return future.get();}catch(InterruptedException e){future.cancel(false);Thread.currentThread().interrupt();throw e;}
     }
@@ -102,10 +107,11 @@ public final class LinkWorldDriver implements WorldService.Driver {
             return new WorldInfo(name,true,0);
         });
     }
-    public byte[] snapshot(String name)throws Exception {
+    private record Captured(SlimeWorld world,ChannelPolicy policy){}
+    private Captured capture(String name)throws Exception {
         key(name);
-        SlimeWorld copy=main(() -> {
-            var result=live(name).getSerializableCopy();
+        return readMain(() -> {
+            var result=LinkChunkSnapshots.freeze((SlimeWorld)live(name));
             if(NativeJournal.enabled()){
                 var saved=new net.minecraft.nbt.CompoundTag();
                 ((org.bukkit.craftbukkit.CraftWorld)Bukkit.getWorld(name)).getHandle().getDataStorage().linkSnapshot().forEach((id,tag)->{
@@ -113,10 +119,11 @@ public final class LinkWorldDriver implements WorldService.Driver {
                 });
                 result.getExtraData().put("LinkSavedData",com.infernalsuite.asp.Converter.convertTag(saved));
             }
-            return result;
+            return new Captured(result,LinkTemplateGui.policy(Bukkit.getWorld(name)));
         });
-        return asp.getSerializer().serializeWorld(copy);
     }
+    public byte[] snapshot(String name)throws Exception {return asp.getSerializer().serializeWorld(capture(name).world());}
+    public WorldService.Publication publication(String name)throws Exception {var copy=capture(name);return new WorldService.Publication(asp.getSerializer().serializeWorld(copy.world()),copy.policy());}
     public WorldInfo instantiate(String name,byte[] srf,boolean persistent)throws Exception {
         key(name);
         var stored=store.read(key(name));
@@ -187,7 +194,12 @@ public final class LinkWorldDriver implements WorldService.Driver {
         store.commit(new Transaction(UUID.randomUUID(),List.of(guard),List.of(new Change(key(name),state.version(),1,"world:deleted",new byte[0]))));
     }
     public List<WorldInfo> loaded()throws Exception {
-        return main(() -> managed.entrySet().stream().map(e -> new WorldInfo(e.getKey(),e.getValue(),live(e.getKey()).getBukkitWorld().getPlayerCount())).toList());
+        return readMain(() -> managed.entrySet().stream().map(e -> new WorldInfo(e.getKey(),e.getValue(),live(e.getKey()).getBukkitWorld().getPlayerCount())).toList());
+    }
+    public boolean exists(String name)throws Exception {return NativeJournal.enabled()?readMain(()->NativeJournal.knownWorld(name)):store.read(key(name)).isPresent();}
+    public ChannelPolicy channelPolicy(String name)throws Exception {return readMain(()->LinkTemplateGui.policy(live(name).getBukkitWorld()));}
+    public Destination spawn(String name)throws Exception {
+        return readMain(()->{var pos=LinkTemplateGui.spawn(live(name).getBukkitWorld());return new Destination(node,name,pos.getX(),pos.getY(),pos.getZ(),pos.getYaw(),pos.getPitch());});
     }
     public void saveOnShutdown() throws Exception {
         for(String name:List.copyOf(managed.keySet()))if(Boolean.TRUE.equals(managed.get(name)))save(name);

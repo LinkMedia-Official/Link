@@ -100,3 +100,26 @@ CREATE TABLE IF NOT EXISTS link_teleport_requests (
 CREATE INDEX IF NOT EXISTS link_tp_requester_idx ON link_teleport_requests(requester,created_at);
 CREATE INDEX IF NOT EXISTS link_tp_recipient_idx ON link_teleport_requests(recipient,expires_at);
 CREATE INDEX IF NOT EXISTS link_tp_expiry_idx ON link_teleport_requests(expires_at);
+CREATE TABLE IF NOT EXISTS link_template_channels (
+ name text NOT NULL, version integer NOT NULL, capacity integer NOT NULL, max_channels integer NOT NULL,
+ auto_expand boolean NOT NULL, network_wide boolean NOT NULL, PRIMARY KEY(name,version)
+);
+CREATE TABLE IF NOT EXISTS link_warp_groups (
+ name text PRIMARY KEY, template text NOT NULL, version integer NOT NULL, home_node text NOT NULL,
+ capacity integer NOT NULL, max_channels integer NOT NULL, auto_expand boolean NOT NULL, network_wide boolean NOT NULL
+);
+CREATE TABLE IF NOT EXISTS link_group_worlds (
+ id text PRIMARY KEY, group_name text NOT NULL, node text NOT NULL, world text NOT NULL,
+ state text NOT NULL, UNIQUE(node,world)
+);
+CREATE INDEX IF NOT EXISTS link_group_worlds_group_idx ON link_group_worlds(group_name,state);
+CREATE TABLE IF NOT EXISTS link_group_requests (
+ id uuid PRIMARY KEY, player uuid NOT NULL, group_name text NOT NULL, node text NOT NULL, epoch bigint NOT NULL,
+ state text NOT NULL, expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS link_group_requests_node_idx ON link_group_requests(node,state);
+
+CREATE TABLE IF NOT EXISTS link_route_receipts (
+ id uuid PRIMARY KEY, player uuid NOT NULL, node text NOT NULL,
+ epoch bigint NOT NULL, details bytea NOT NULL, claimed boolean NOT NULL DEFAULT false
+);

@@ -3,12 +3,18 @@ package io.linkmc.core;
 import io.linkmc.api.LinkApi.Worlds;
 import io.linkmc.api.LinkApi.WorldInfo;
 import io.linkmc.api.LinkApi;
+import io.linkmc.api.LinkApi.Destination;
 import java.util.List;
 import java.util.concurrent.*;
 
 /** Serializes lifecycle operations and delegates all live-world work to a tick-thread driver. */
 public final class WorldService implements Worlds, AutoCloseable {
+    public record Publication(byte[] bytes,LinkApi.ChannelPolicy policy){}
     public interface Driver {
+        default Publication publication(String name)throws Exception{return new Publication(snapshot(name),channelPolicy(name));}
+        default boolean exists(String name)throws Exception {throw new UnsupportedOperationException();}
+        default LinkApi.ChannelPolicy channelPolicy(String name)throws Exception {return LinkApi.ChannelPolicy.defaults();}
+        default Destination spawn(String name) throws Exception { throw new UnsupportedOperationException(); }
         WorldInfo createEditor(String name) throws Exception;
         /** Must obtain a stable snapshot, not concurrently serialize a live mutable world. */
         byte[] snapshot(String name) throws Exception;
@@ -29,9 +35,14 @@ public final class WorldService implements Worlds, AutoCloseable {
         catch(RejectedExecutionException e){return CompletableFuture.failedFuture(e);}
     }
     public CompletionStage<List<String>> templates(){return run(templates::list);}
+    public CompletionStage<Destination> spawn(String name){LinkApi.requireName(name);return run(()->driver.spawn(name));}
     public CompletionStage<WorldInfo> createEditor(String name){LinkApi.requireName(name);return run(() -> driver.createEditor(name));}
-    public CompletionStage<Void> publish(String editor,String template,int version){LinkApi.requireName(editor);LinkApi.requireName(template);version(version);return run(() -> {templates.publish(template,version,driver.snapshot(editor));return null;});}
+    public CompletionStage<Void> publish(String editor,String template,int version){LinkApi.requireName(editor);LinkApi.requireName(template);version(version);return run(() -> {var publication=driver.publication(editor);templates.publish(template,version,publication.bytes(),publication.policy());return null;});}
     public CompletionStage<WorldInfo> create(String name,String template,int version,boolean persistent){LinkApi.requireName(name);LinkApi.requireName(template);version(version);return run(() -> driver.instantiate(name,templates.read(template,version),persistent));}
+    public CompletionStage<WorldInfo> ensurePersistent(String name,String template,int version){
+        LinkApi.requireName(name);LinkApi.requireName(template);version(version);
+        return run(()->{var live=driver.loaded().stream().filter(w->w.name().equals(name)).findFirst();if(live.isPresent())return live.get();return driver.exists(name)?driver.load(name):driver.instantiate(name,templates.read(template,version),true);});
+    }
     private static void version(int version){if(version<1)throw new IllegalArgumentException("Template version must be positive");}
     public CompletionStage<WorldInfo> load(String name){return run(() -> driver.load(name));}
     public CompletionStage<Void> save(String name){return run(() -> {driver.save(name);return null;});}

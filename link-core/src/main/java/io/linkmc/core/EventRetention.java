@@ -18,9 +18,9 @@ public final class EventRetention {
                 r.next();cutoff=Timestamp.from(instant(r,1).minus(Duration.ofHours(hours)));
             }
             List<UUID> operations=new ArrayList<>();
-            // Preserve complete transactions that still contain any aggregate's latest revision.
-            // Concurrent commits only advance revisions, so a selected historical operation cannot become latest.
-            try(var s=sql(c,"SELECT o.id FROM link_operations o WHERE NOT o.events_pruned AND o.created_at<? AND NOT EXISTS (SELECT 1 FROM link_events e JOIN link_state s ON s.id=e.aggregate_id AND s.version=e.version WHERE e.operation=o.id) ORDER BY o.created_at,o.id LIMIT ? FOR UPDATE SKIP LOCKED",cutoff,batch);var r=s.executeQuery()){
+            // Recovery reads link_state, so even the last legacy event can expire.
+            // New operations are created with events_pruned=true and need no scan/update here.
+            try(var s=sql(c,"SELECT o.id FROM link_operations o WHERE NOT o.events_pruned AND o.created_at<? ORDER BY o.created_at,o.id LIMIT ? FOR UPDATE SKIP LOCKED",cutoff,batch);var r=s.executeQuery()){
                 while(r.next())operations.add(r.getObject(1,UUID.class));
             }
             int events=0;
@@ -36,6 +36,10 @@ public final class EventRetention {
             List<UUID> requests=new ArrayList<>();
             try(var s=sql(c,"SELECT id FROM link_teleport_requests WHERE expires_at<? ORDER BY expires_at,id LIMIT ? FOR UPDATE SKIP LOCKED",cutoff,batch);var r=s.executeQuery()){while(r.next())requests.add(r.getObject(1,UUID.class));}
             for(UUID request:requests)update(c,"DELETE FROM link_teleport_requests WHERE id=?",request);
+            List<UUID> groupRequests=new ArrayList<>();
+            try(var s=sql(c,"SELECT id FROM link_group_requests WHERE expires_at<? ORDER BY expires_at,id LIMIT ? FOR UPDATE SKIP LOCKED",cutoff,batch);var r=s.executeQuery()){while(r.next())groupRequests.add(r.getObject(1,UUID.class));}
+            for(UUID request:groupRequests)update(c,"DELETE FROM link_group_requests WHERE id=?",request);
+            requests.addAll(groupRequests);
             return new Result(operations.size(),events,delivered.size(),requests.size());
         });
     }

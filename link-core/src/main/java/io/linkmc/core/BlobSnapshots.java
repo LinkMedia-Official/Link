@@ -16,7 +16,7 @@ public final class BlobSnapshots {
         for(int i=0;i<parts;i++)states.put(key+"/"+i,Arrays.copyOfRange(bytes,i*PART,Math.min(bytes.length,(i+1)*PART)));
     }
     public static Optional<byte[]> get(Map<String,byte[]> states,String key)throws Exception{
-        byte[] data=states.get(key+"/manifest");if(data==null)return Optional.empty();
+        byte[] data=states.get(key+"/manifest");if(data==null||data.length==0)return Optional.empty();
         if(data.length!=40)throw new IllegalStateException("Invalid snapshot manifest");
         var manifest=ByteBuffer.wrap(data);int length=manifest.getInt(),parts=manifest.getInt();
         if(length<0 || length>512*1024*1024 || parts!=(length+PART-1)/PART)throw new IllegalStateException("Invalid snapshot size");

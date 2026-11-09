@@ -8,14 +8,14 @@ import java.util.*;
 public final class FrameCommitter {
     @FunctionalInterface public interface Writer { Commit commit(Transaction transaction) throws Exception; }
     private final Writer writer;
-    private final Map<String,State> committed=new HashMap<>();
-    private boolean failed;
+    private final Map<String,State> committed=new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile boolean failed;
     public FrameCommitter(Writer writer){this.writer=writer;}
-    public synchronized void restore(State state){
+    public void restore(State state){
         if(failed)throw new IllegalStateException("Frame journal is failed");
-        committed.put(state.id(),state);
+        committed.compute(state.id(),(key,previous)->previous==null||state.version()>=previous.version()?state:previous);
     }
-    public synchronized Optional<State> state(String id){return Optional.ofNullable(committed.get(id));}
+    public Optional<State> state(String id){return Optional.ofNullable(committed.get(id));}
     /** All supplied bytes are copied by Change. Retries reuse the exact operation and payload. */
     public synchronized void commit(List<Session> owners,Map<String,byte[]> snapshots,Runnable publish) throws Exception {
         if(failed)throw new IllegalStateException("Frame journal is failed");
@@ -32,10 +32,10 @@ public final class FrameCommitter {
                     // A lost COMMIT response is reconciled by replaying the same idempotent operation.
                     try{writer.commit(transaction);}catch(Exception retry){retry.addSuppressed(uncertain);throw retry;}
                 }
-                for(Change change:changes)committed.put(change.id(),new State(change.id(),change.expectedVersion()+1,change.schema(),change.after()));
+                for(Change change:changes)restore(new State(change.id(),change.expectedVersion()+1,change.schema(),change.after()));
             }
             publish.run();
         }catch(Exception error){failed=true;throw error;}
     }
-    public synchronized boolean failed(){return failed;}
+    public boolean failed(){return failed;}
 }

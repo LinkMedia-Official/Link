@@ -73,7 +73,7 @@ final class LinkEditors implements LinkApi.Editors {
                 if(world==null)throw new EditorError("작업 월드가 언로드되었습니다.");
                 Location back=player.getLocation();
                 Visit next=previous!=null?previous:new Visit(workspace,back.getWorld().getUID(),back.getX(),back.getY(),back.getZ(),back.getYaw(),back.getPitch());
-                if(!player.teleport(world.getSpawnLocation()))throw new EditorError("다른 플러그인이 편집 월드 입장을 취소했습니다.");
+                if(!player.teleport(LinkTemplateGui.spawn(world)))throw new EditorError("다른 플러그인이 편집 월드 입장을 취소했습니다.");
                 player.getPersistentDataContainer().set(KEY,PersistentDataType.STRING,JSON.toJson(next));
                 return null;
             });
@@ -94,6 +94,18 @@ final class LinkEditors implements LinkApi.Editors {
     }
     public CompletionStage<Void> enter(UUID id,String workspace){
         LinkApi.requireName(workspace);return exclusive(id,()->enterWorld(id,workspace));
+    }
+    public CompletionStage<Void> openSettings(UUID id){
+        return main(()->{Player p=player(id);World world=editable(p,null);LinkTemplateGui.open(p,world,this);return null;});
+    }
+    static World editable(Player p,UUID expected){
+        if(!p.hasPermission("link.admin"))throw new EditorError("link.admin 권한이 필요합니다.");
+        Visit visit=required(p);World world=p.getWorld();
+        if(!world.getName().equals(visit.workspace())||(expected!=null&&!expected.equals(world.getUID())))throw new EditorError("설정을 연 편집 월드 안에서 사용하세요.");
+        return world;
+    }
+    CompletionStage<Void> configure(UUID id,UUID worldId,java.util.function.Consumer<World> change){
+        return exclusive(id,()->main(()->{World world=editable(player(id),worldId);change.accept(world);return world.getName();}).thenCompose(worlds::save));
     }
     public CompletionStage<Void> save(UUID id,String template,int version,boolean exit){
         LinkApi.requireName(template);positive(version);
