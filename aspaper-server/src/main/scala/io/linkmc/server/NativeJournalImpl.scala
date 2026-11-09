@@ -192,7 +192,8 @@ object NativeJournalImpl {
   private[server] def worldOrTemplate(name: String, template: Array[Byte]): Array[Byte] = {
     if (!enabled()) return template
     instance.catalog.putIfAbsent(name, java.lang.Byte.valueOf(0.toByte))
-    snapshot(name).orElse(template)
+    // Temporary worlds are never checkpointed: always start from the template, ignoring any snapshot an older build left.
+    if (temporaryWorld(name)) template else snapshot(name).orElse(template)
   }
   private[server] def createdWorld(name: String, persistent: Boolean): Unit = {
     if (enabled()) {
@@ -206,6 +207,8 @@ object NativeJournalImpl {
   private[server] def knownWorld(name: String): Boolean = enabled() && instance.catalog.containsKey(name)
   private[server] def storedWorldExists(name: String): Boolean = knownWorld(name) && !Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(2.toByte))
   private[server] def persistentWorld(name: String): Boolean = enabled() && Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(1.toByte))
+  /** Explicitly created as temporary (spawn copies of a template). Worlds Link does not know are NOT temporary. */
+  private[server] def temporaryWorld(name: String): Boolean = enabled() && Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(0.toByte))
   @throws[Exception]
   private[server] def storedWorld(name: String): Array[Byte] = {
     if (!instance.catalog.containsKey(name) || Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(2.toByte))) throw new ConflictException("Unknown or deleted world")
@@ -217,7 +220,8 @@ object NativeJournalImpl {
   private[server] def recoveredWorlds(): java.util.List[String] = {
     if (!enabled()) return java.util.List.of[String]()
     val data = instance.restored.get("native:" + instance.node + "/worlds")
-    if (data == null) java.util.List.of[String]() else Arrays.asList(new String(data, StandardCharsets.UTF_8).split("\n")*)
+    if (data == null) java.util.List.of[String]()
+    else Arrays.asList(new String(data, StandardCharsets.UTF_8).split("\n")*).stream().filter(n => !n.isEmpty && !temporaryWorld(n)).toList()
   }
   @throws[Exception]
   private[server] def recoveredWorld(name: String): Array[Byte] = snapshot(name).orElseThrow()
@@ -482,12 +486,16 @@ object NativeJournalImpl {
       val worlds = Bukkit.getWorlds().iterator()
       while (worlds.hasNext) {
         val world = worlds.next()
+        // Temporary worlds (template copies) are rebuilt from their template after a crash: no chunk or world data
+        // capture. Their players are still saved with every checkpoint.
+        if (!temporaryWorld(world.getName())) {
         storages.put("native:" + node + "/saved/world/" + world.getName(), world.asInstanceOf[org.bukkit.craftbukkit.CraftWorld].getHandle().getDataStorage())
         val slime = SlimeNMSBridge.instance().getInstance(world)
         if (slime == null) throw new IllegalStateException("Native journal only accepts slime worlds: " + world.getName())
         worldNames.add(world.getName())
         val frozen = chunkSnapshots.freezeIncremental(slime.asInstanceOf[com.infernalsuite.asp.api.world.SlimeWorld], fullCapture || !INCREMENTAL)
         capturedWorlds.add(CapturedWorld(worldKey(world.getName()), frozen.changed, frozen.carried))
+        }
       }
       Collections.sort(worldNames); snapshots.put("native:" + node + "/worlds", String.join("\n", worldNames).getBytes(StandardCharsets.UTF_8))
       catalog.forEach((name, state) => { snapshots.put("native:" + node + "/catalog/" + name, Array[Byte](state.byteValue())) })

@@ -288,3 +288,10 @@ Verification: 86 core tests passed on each of PostgreSQL 17 and MariaDB 11.4; on
 **Scala 전환.** link-core·link-velocity·`io.linkmc.server`를 Scala 3.10.0(Java 25, LinkCore와 동일 런타임)으로 1:1 변환했습니다. 패치에서 호출하는 `NativeJournal`·`LinkRuntime`은 Java 진입점으로 남고 `LinkServerBridge`(ServiceLoader)로 Scala 구현을 호출합니다. `LinkConfiguration`·`LinkPacketGate`·`ConflictException`·`link-api`는 Java입니다. 서버 JAR은 `scala-library`·`scala3-library_3` 3.10.0을 포함하며 LinkCore가 포함한 런타임과 같은 버전입니다.
 
 **검증.** PostgreSQL 17·MariaDB 11.4 core 테스트 각 98개(S3 전용 1개 제외), Velocity 5개, 서버 Link 93개 통과. 실제 서버(Scala 빌드): 1,296개 강제 로드 청크·블록 레이어·armor stand 300개·상자 40개 상태에서 블록·상자·엔티티 변경 후 강제 종료 → 재시작 시 모두 복구(armor stand 301/301). PostgreSQL 컨테이너 20초 일시 정지 중 TPS 20.0 유지·서버 정지 없음, 장애 중 변경이 복구 후 저장되고 강제 종료 뒤에도 유지. 캡처 시간: 6,368청크 107~196ms → 증분 31~52ms(Java 빌드 측정), 200명 합성 플레이어 캡처 44~55ms. LinkCore 0.1.0-SNAPSHOT JAR을 같은 서버에 설치해 Scala 클래스 충돌(LinkageError 등) 없이 로드됨을 확인(활성화는 LinkCore DB 미설정으로 실패). 실제 200명 클라이언트 부하, 다중 백엔드 Velocity 이동, 25초를 넘는 DB 장애(소유권 보호로 정지)는 이번 검사 범위가 아닙니다.
+
+## 2026-11-10 임시 월드 체크포인트 제외
+
+- 템플릿에서 만든 임시 월드(`link-spawn`, `spawn-*`, `/link create … temporary`)는 체크포인트에서 청크/월드 데이터를 캡처하지 않는다. 크래시 후에는 템플릿에서 다시 만든다. 그 월드에 있던 플레이어 데이터는 계속 저장된다.
+- 영구 월드(`/link create … persistent`, API `persistent=true`, 템플릿 편집 월드)와 Link가 모르는 월드는 기존대로 변경 청크를 캡처한다.
+- 실서버 강제 종료 테스트: `island-test`(영구) 블록 유지, `link-template-editor`(편집) 블록 유지, `link-spawn`(임시) 블록은 템플릿 상태로 복귀. 캡처는 2 worlds / 2~50청크 / 2~3ms.
+- 서버 테스트 93개 통과.
