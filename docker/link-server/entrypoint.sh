@@ -6,6 +6,11 @@ INTERNAL_IP=$(ip route get 1 2>/dev/null | awk '{print $(NF-2);exit}')
 export INTERNAL_IP
 export TZ=${TZ:-UTC}
 
+# 패널은 빈 변수도 넘긴다. 빈 LINK_* 값이 link.yml 설정을 덮어쓰지 않도록 지운다
+for name in LINK_NODE_ID LINK_JDBC_URL LINK_DB_USER LINK_DB_PASSWORD LINK_REDIS_URI LINK_S3_ACCESS_KEY LINK_S3_SECRET_KEY; do
+    if [ -z "${!name}" ]; then unset "$name"; fi
+done
+
 # EULA=true 이면 eula.txt 자동 작성 (Minecraft EULA 동의)
 if [ "${EULA,,}" = "true" ]; then
     echo "eula=true" > eula.txt

@@ -1,0 +1,126 @@
+{
+    "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-11-10T00:00:00+00:00",
+    "name": "Link (Minecraft 26.3)",
+    "author": "linkstudiokr@gmail.com",
+    "description": "Link (Advanced Slime Paper 기반 Bukkit 서버) 26.3, Scala 3.10.0 / Java 25. 소스: https://github.com/LinkMedia-Official/Link . 서버 jar 는 Docker 이미지에 포함되어 있고 dev/26.3 커밋마다 자동 빌드됩니다. PostgreSQL 17 또는 MariaDB 11.4 가 필요합니다.",
+    "features": [
+        "eula",
+        "java_version",
+        "pid_limit"
+    ],
+    "docker_images": {
+        "Link 26.3 (Java 25, 최신)": "ghcr.io/linkmedia-official/link-server:26.3"
+    },
+    "file_denylist": [],
+    "startup": "java -Xms128M -XX:MaxRAMPercentage=95.0 -Dterminal.jline=false -Dterminal.ansi=true {{JVM_FLAGS}} -jar {{SERVER_JARFILE}} nogui",
+    "config": {
+        "files": "{\n    \"server.properties\": {\n        \"parser\": \"properties\",\n        \"find\": {\n            \"server-ip\": \"0.0.0.0\",\n            \"server-port\": \"{{server.build.default.port}}\",\n            \"query.port\": \"{{server.build.default.port}}\"\n        }\n    }\n}",
+        "startup": "{\n    \"done\": \")! For help, type \"\n}",
+        "logs": "{}",
+        "stop": "stop"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/ash\n# Link 서버 설치 스크립트 (Pterodactyl installer 컨테이너에서 실행)\n# 서버 jar 는 Docker 이미지에 포함되어 있고 첫 시작 시 자동으로 복사된다.\nset -e\nmkdir -p /mnt/server\ncd /mnt/server\n\nif [ ! -f server.properties ]; then\n  cat > server.properties <<PROPS\nserver-ip=0.0.0.0\nserver-port=25565\nquery.port=25565\nmotd=A Link Minecraft Server\nPROPS\nfi\n\necho \"설치 완료 - 서버 jar 는 첫 시작 시 이미지에서 복사됩니다.\"\necho \"DB 접속 정보는 패널 변수(LINK_JDBC_URL 등)나 첫 실행 후 생성되는 link.yml 에서 설정하세요.\"\n",
+            "container": "ghcr.io/pterodactyl/installers:alpine",
+            "entrypoint": "ash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Server Jar File",
+            "description": "실행할 서버 jar 파일 이름",
+            "env_variable": "SERVER_JARFILE",
+            "default_value": "server.jar",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|regex:/^([\\w\\d._-]+)(\\.jar)$/",
+            "field_type": "text"
+        },
+        {
+            "name": "Accept EULA",
+            "description": "true 로 설정하면 Minecraft EULA(https://aka.ms/MinecraftEULA)에 동의하고 eula.txt 를 자동 작성합니다.",
+            "env_variable": "EULA",
+            "default_value": "false",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Auto Update Jar",
+            "description": "true 면 시작할 때마다 이미지에 포함된 Link jar 로 서버 jar 를 맞춥니다. 직접 올린 jar 를 쓰려면 false.",
+            "env_variable": "AUTO_UPDATE_JAR",
+            "default_value": "true",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Extra JVM Flags",
+            "description": "추가 JVM 옵션 (예: -XX:+UseG1GC). 비워둬도 됩니다.",
+            "env_variable": "JVM_FLAGS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        },
+        {
+            "name": "Link Node ID",
+            "description": "백엔드 서버마다 다른 이름(영문/숫자/-/_). 비우면 link.yml 의 node.id 를 씁니다. 같은 DB 를 쓰는 서버끼리 겹치면 안 됩니다.",
+            "env_variable": "LINK_NODE_ID",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:64|regex:/^[A-Za-z0-9_-]*$/",
+            "field_type": "text"
+        },
+        {
+            "name": "Database JDBC URL",
+            "description": "예: jdbc:postgresql://<호스트>:5432/link 또는 jdbc:mariadb://<호스트>:3306/link . 비우면 link.yml 의 database.jdbc-url 을 씁니다.",
+            "env_variable": "LINK_JDBC_URL",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512|regex:/^(jdbc:(postgresql|mariadb):.*)?$/",
+            "field_type": "text"
+        },
+        {
+            "name": "Database User",
+            "description": "DB 사용자. 비우면 link.yml 값을 씁니다.",
+            "env_variable": "LINK_DB_USER",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Database Password",
+            "description": "DB 비밀번호. 비우면 link.yml 값을 씁니다.",
+            "env_variable": "LINK_DB_PASSWORD",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:256",
+            "field_type": "text"
+        },
+        {
+            "name": "Redis URI",
+            "description": "예: redis://<호스트>:6379 . 비우면 link.yml 의 redis 설정을 씁니다.",
+            "env_variable": "LINK_REDIS_URI",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        }
+    ]
+}
