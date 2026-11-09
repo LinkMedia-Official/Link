@@ -14,7 +14,7 @@
         "pid_limit"
     ],
     "docker_images": {
-        "Link 26.3 (Java 25, 최신)": "ghcr.io/linkmedia-official/link-server:26.3"
+        "Link 26.3 Java 25": "ghcr.io/linkmedia-official/link-server:26.3"
     },
     "file_denylist": [],
     "startup": "java -Xms128M -XX:MaxRAMPercentage=95.0 -Dterminal.jline=false -Dterminal.ansi=true {{JVM_FLAGS}} -jar {{SERVER_JARFILE}} nogui",
