@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Link <link@localhost>
+Date: Tue, 10 Nov 2026 04:37:02 +0900
+Subject: [PATCH] Link chunk change counter for incremental checkpoints
+
+
+diff --git a/net/minecraft/world/level/chunk/ChunkAccess.java b/net/minecraft/world/level/chunk/ChunkAccess.java
+index 39ea7198f3bbe4525e686504887e0074de80854d..1ad7c85608eee6a741e879243d33fe7a032c45d4 100644
+--- a/net/minecraft/world/level/chunk/ChunkAccess.java
++++ b/net/minecraft/world/level/chunk/ChunkAccess.java
+@@ -341,8 +341,14 @@ public abstract class ChunkAccess implements LightChunk, StructureAccess, BiomeR
+         return true;
+     }
+ 
++    // Link start - change counter for incremental checkpoints
++    /** Incremented on every change vanilla marks unsaved. Never reset by Paper's own save paths. */
++    public volatile long linkModCount;
++    // Link end - change counter for incremental checkpoints
++
+     public void markUnsaved() {
+         this.unsaved = true;
++        this.linkModCount++; // Link - change counter for incremental checkpoints
+     }
+ 
+     public boolean tryMarkSaved() {

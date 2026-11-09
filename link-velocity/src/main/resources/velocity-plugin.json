@@ -1,0 +1,1 @@
+{"id":"link","name":"Link","version":"0.1.0-SNAPSHOT","description":"Link transactional backend routing","authors":[],"dependencies":[],"provides":[],"main":"io.linkmc.velocity.LinkVelocity"}

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Link <link@localhost>
+Date: Tue, 10 Nov 2026 04:20:47 +0900
+Subject: [PATCH] Link non-blocking arrival claim
+
+
+diff --git a/net/minecraft/server/network/config/PrepareSpawnTask.java b/net/minecraft/server/network/config/PrepareSpawnTask.java
+index e1ce7242ebcb60013e249f59d5924bd01a01fa8d..9dcc19dc9a271cf640cdab384e86dd609dd46a53 100644
+--- a/net/minecraft/server/network/config/PrepareSpawnTask.java
++++ b/net/minecraft/server/network/config/PrepareSpawnTask.java
+@@ -48,10 +48,25 @@ public class PrepareSpawnTask implements ConfigurationTask {
+         this.server = server;
+         this.nameAndId = new net.minecraft.server.players.NameAndId(profile); // Paper - passthrough profile and packet listener - create from profile
+         this.loadListener = LevelLoadListener.noop(); // Paper - per level load listener - this is already a no-op on dedicated server, but we moved it to Level
++        io.linkmc.server.NativeJournal.prefetchArrival(this.nameAndId.id(), listener.connection); // Link - claim arrival off the server thread
+     }
+ 
++    // Link start - non-blocking arrival claim
++    private @Nullable Consumer<Packet<?>> linkDeferredStart;
++
+     @Override
+     public void start(final Consumer<Packet<?>> connection) {
++        // The database arrival claim was started off-thread when this task was created. Never wait for it on the
++        // server thread: defer the real start to tick() until it has finished.
++        if (!io.linkmc.server.NativeJournal.arrivalReady(this.nameAndId.id(), this.listener.connection)) {
++            this.linkDeferredStart = connection;
++            return;
++        }
++        this.linkStart(connection);
++    }
++
++    private void linkStart(final Consumer<Packet<?>> connection) {
++    // Link end - non-blocking arrival claim
+         io.linkmc.server.NativeJournal.prepare(this.nameAndId.id(), this.listener.connection);
+         try (ProblemReporter.ScopedCollector reporter = new ProblemReporter.ScopedCollector(LOGGER)) {
+             Optional<ValueInput> loadedData = this.server
+@@ -125,6 +140,14 @@ public class PrepareSpawnTask implements ConfigurationTask {
+ 
+     @Override
+     public boolean tick() {
++        // Link start - non-blocking arrival claim
++        if (this.linkDeferredStart != null) {
++            if (!io.linkmc.server.NativeJournal.arrivalReady(this.nameAndId.id(), this.listener.connection)) return false;
++            Consumer<Packet<?>> deferred = this.linkDeferredStart;
++            this.linkDeferredStart = null;
++            this.linkStart(deferred);
++        }
++        // Link end - non-blocking arrival claim
+         return switch (this.state) {
+             case null -> false;
+             case PrepareSpawnTask.Preparing preparing -> {

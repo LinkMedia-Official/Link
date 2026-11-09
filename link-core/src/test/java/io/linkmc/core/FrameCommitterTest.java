@@ -35,10 +35,24 @@ class FrameCommitterTest {
         AtomicBoolean sent=new AtomicBoolean();journal.commit(List.of(),Map.of("test:a",new byte[]{1}),()->sent.set(true));
         assertTrue(sent.get());assertEquals(1,journal.state("test:a").orElseThrow().version());
     }
-    @Test void failureDiscardsPublicationAndPermanentlyFencesEngine(){
-        FrameCommitter journal=new FrameCommitter(tx->{throw new SQLException("offline");});
+    @Test void storageOutageDiscardsPublicationAndReplaysSameOperationLater()throws Exception{
+        AtomicBoolean offline=new AtomicBoolean(true);List<Transaction> seen=new ArrayList<>();
+        FrameCommitter journal=new FrameCommitter(tx->{seen.add(tx);if(offline.get())throw new SQLException("offline");return new Commit(tx.operation(),false);});
         AtomicBoolean sent=new AtomicBoolean();
         assertThrows(SQLException.class,()->journal.commit(List.of(),Map.of("test:a",new byte[]{1}),()->sent.set(true)));
+        assertFalse(sent.get());assertFalse(journal.failed());assertTrue(journal.pendingRetry());assertTrue(journal.state("test:a").isEmpty());
+        UUID unresolved=seen.get(0).operation();
+        offline.set(false);seen.clear();
+        journal.commit(List.of(),Map.of("test:a",new byte[]{1},"test:b",new byte[]{2}),()->sent.set(true));
+        assertTrue(sent.get());assertFalse(journal.pendingRetry());
+        assertEquals(unresolved,seen.get(0).operation(),"the unknown frame is replayed first with the same operation ID");
+        assertEquals(List.of("test:b"),seen.get(1).changes().stream().map(Change::id).toList(),"replayed state is not written twice");
+        assertEquals(1,journal.state("test:a").orElseThrow().version());assertEquals(1,journal.state("test:b").orElseThrow().version());
+    }
+    @Test void ownershipConflictPermanentlyFencesEngine(){
+        FrameCommitter journal=new FrameCommitter(tx->{throw new ConflictException("Backend instance was replaced or its lease expired");});
+        AtomicBoolean sent=new AtomicBoolean();
+        assertThrows(ConflictException.class,()->journal.commit(List.of(),Map.of("test:a",new byte[]{1}),()->sent.set(true)));
         assertFalse(sent.get());assertTrue(journal.failed());assertTrue(journal.state("test:a").isEmpty());
         assertThrows(IllegalStateException.class,()->journal.commit(List.of(),Map.of(),()->sent.set(true)));
     }

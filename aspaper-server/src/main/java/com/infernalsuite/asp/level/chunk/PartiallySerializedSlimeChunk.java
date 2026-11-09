@@ -109,6 +109,28 @@ public record PartiallySerializedSlimeChunk(
         );
     }
 
+    /**
+     * Link: a chunk whose blocks did not change since {@code previous} was copied. Re-captures the parts that can
+     * change without a block change (entities, block entities, POI, ticks, chunk PDC) and reuses the immutable
+     * section/light/heightmap copies of {@code previous}.
+     */
+    public static PartiallySerializedSlimeChunk refreshVolatile(PartiallySerializedSlimeChunk previous, NMSSlimeChunk slimeChunk, boolean saveBlockTicks, boolean saveFluidTicks, boolean savePoi) {
+        LevelChunk chunk = slimeChunk.getChunk();
+        List<SavedTick<Block>> blockTicks = null;
+        List<SavedTick<Fluid>> fluidTicks = null;
+        if (saveBlockTicks || saveFluidTicks) {
+            ChunkAccess.PackedTicks ticksForSerialization = chunk.getTicksForSerialization(chunk.level.getGameTime());
+            if (saveBlockTicks) blockTicks = ticksForSerialization.blocks();
+            if (saveFluidTicks) fluidTicks = ticksForSerialization.fluids();
+        }
+        Map<String, BinaryTag> extra = new HashMap<>(slimeChunk.getExtraData());
+        extra.put("ChunkBukkitValues", Converter.convertTag(chunk.persistentDataContainer.toTagCompound()));
+        return new PartiallySerializedSlimeChunk(
+                previous.containerFactory(), previous.x(), previous.z(), previous.sections(), previous.heightMap(),
+                slimeChunk.getTileEntities(), slimeChunk.getEntities(), extra, previous.upgradeData(),
+                savePoi ? slimeChunk.getPoiChunkSections() : null, blockTicks, fluidTicks);
+    }
+
     @Override
     public int getX() {
         return this.x;

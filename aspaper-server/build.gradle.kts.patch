@@ -1,5 +1,13 @@
 --- a/paper-server/build.gradle.kts
 +++ b/paper-server/build.gradle.kts
+@@ -6,6 +_,7 @@
+ plugins {
+     `java-library`
+     `maven-publish`
++    scala // Link: io.linkmc.server implementation (Scala 3.10.0, same runtime as LinkCore)
+     idea
+     id("io.papermc.paperweight.core")
+     id("io.papermc.fill.gradle") version "1.0.14"
 @@ -22,9 +_,20 @@
      minecraftVersion = providers.gradleProperty("mcVersion")
      gitFilePatches = false
@@ -23,7 +31,7 @@
  }
  
  tasks.generateDevelopmentBundle {
-@@ -86,7 +_,19 @@
+@@ -86,7 +_,24 @@
      }
  }
  
@@ -40,6 +48,11 @@
 +}
 +val log4jPlugins = sourceSets.create("log4jPlugins") {
 +    java { srcDir("../paper-server/src/log4jPlugins/java") }
++}
++// Link: Scala sees the compiled Java (patched Minecraft/Paper and the Java entry points); Java reaches Scala only
++// through io.linkmc.server bridge interfaces loaded with ServiceLoader, so no joint compilation is needed.
++tasks.withType<ScalaCompile>().configureEach {
++    scalaCompileOptions.additionalParameters = listOf("-release", "25", "-deprecation", "-feature")
 +}
  configurations.named(log4jPlugins.compileClasspathConfigurationName) {
      extendsFrom(configurations.compileClasspath.get())

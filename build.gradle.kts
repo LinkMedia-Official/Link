@@ -4,6 +4,7 @@ import org.gradle.kotlin.dsl.register
 
 plugins {
     java
+    idea // Gradle's Scala plugin wires IDEA Scala support through the root ideaProject task (aspaper-server applies scala + idea)
     id("io.papermc.paperweight.patcher")
 }
 

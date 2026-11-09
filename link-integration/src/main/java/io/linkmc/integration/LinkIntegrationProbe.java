@@ -23,6 +23,7 @@ public final class LinkIntegrationProbe extends JavaPlugin implements org.bukkit
         getCommand("linkprobe").setExecutor((sender,command,label,args)->{
             if(sender instanceof Player||args.length!=1)return false;
             if(args[0].equals("matrix-worlds")){WorldMatrix.run();return true;}
+            if(args.length==1&&args[0].startsWith("bench-players-")){try{CaptureBench.run(Integer.parseInt(args[0].substring("bench-players-".length())));}catch(Exception e){getLogger().log(java.util.logging.Level.SEVERE,"LINK_CAPTURE_BENCH_FAILED",e);}return true;}
             if(args[0].startsWith("travel-")){
                 if(!args[0].equals("travel-repeat")){
                     var player=java.util.Objects.requireNonNull(Bukkit.getPlayerExact("LinkWire"));travelPlayer=player.getUniqueId();travelId=java.util.UUID.randomUUID();

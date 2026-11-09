@@ -32,12 +32,12 @@ class AsyncSavePipelineTest {
             assertEquals(3,peak.get());
         }
     }
-    @Test void preparationFailureCannotCommitOrStartLaterCheckpoint()throws Exception{
+    @Test void preparationFailureCannotCommitButLaterCheckpointMayRetry()throws Exception{
         try(var pipeline=new AsyncSavePipeline(2)){
             var committed=new AtomicBoolean();
             var result=pipeline.submit(()->{pipeline.parallel(List.of(()->{throw new IllegalStateException("upload failure");}));committed.set(true);return null;});
             assertThrows(ExecutionException.class,()->result.get(5,TimeUnit.SECONDS));assertFalse(committed.get());
-            assertThrows(RejectedExecutionException.class,()->pipeline.submit(()->null));
+            assertEquals(7,pipeline.submit(()->7).get(5,TimeUnit.SECONDS));
         }
     }
 }

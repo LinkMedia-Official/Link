@@ -276,3 +276,15 @@ Verification: 86 core tests passed on each of PostgreSQL 17 and MariaDB 11.4; on
 - Scope: the exact Bukkit pre-login access pattern behind the BetonQuest error was reproduced; the user's BetonQuest JAR/quest pack was not installed, so full quest behavior is not claimed. No production DB was accessed and this is not a production load benchmark.
 - Test fixture corrections: an initial cross-world run entered a peaceful test world and regenerated health to 14, causing the strict test assertion to abort that disposable backend. All test worlds were then set to NORMAL. A second run hit Velocity's default login-rate limit on repeated logins; the final run kept each connection open at least 3.2 seconds, then reconnected immediately after disconnect, without changing proxy rate limits. Final run had no Link ownership/checkpoint/pre-login failures. Windows OSHI performance-counter and upstream version-fetch warnings are unrelated environment warnings.
 - Evidence: build/travel-final-pg.log, build/travel-final-maria.log, build/travel-final-build.log, build/travel-wire-pass.log, build/yaml-firstboot/travel-a2.stdout.log, build/tpa-backend-b/travel-b2.stdout.log. Backend SHA-256 67183E84142C701BDF06F5B85E6AEE6CD0B3BCD6C921296D4A7675A8A816E257 matched both tested backend copies and the distribution.
+
+## 2026-11-10 서버 멈춤 차단 + Scala 3.10.0 전환
+
+**정지 정책 변경(선택적 정지).** 게임/플러그인 예외는 일반 Paper와 같이 처리합니다(패킷 → 해당 플레이어 연결 해제, 작업 → 로그). DB·S3 저장 실패와 120초 이상 진행 없는 저장은 서버를 멈추지 않고 5초마다 재시도합니다. 결과를 알 수 없는 커밋은 같은 작업 ID로 먼저 재전송합니다. 노드 lease는 DB 장애 중에도 남은 유효 시간(30초 중 25초)까지 재시도합니다. 정지하는 경우는 소유권 상실(다른 인스턴스 인계, lease 만료, 저널 버전 충돌)뿐입니다.
+
+**메인 스레드 대기 제거.** 서버 간 이동은 다음 체크포인트에서 캡처·동결 후 커밋 완료 시 이어서 진행합니다. 접속 도착 claim·플레이어 데이터 조회(PrepareSpawnTask, 패치 0013), 라우트 status/claim/prepareRemote, 세션 해제·READY·로컬 이동 확인·플레이어 등록 SQL은 별도 스레드에서 실행합니다. 월드 로드는 저장 완료를 틱 차단 없이 기다리고 다운로드·디코딩은 별도 스레드에서 합니다. Velocity 재접속 대기는 작업 스레드를 붙잡지 않습니다. 메인 스레드를 50ms 넘게 붙잡는 SQL은 호출 위치와 함께 경고합니다.
+
+**증분 청크 캡처(패치 0014).** `ChunkAccess.markUnsaved`의 Link 전용 변경 카운터, 인접 청크, 직전 변경 청크, 엔티티·블록 엔티티·예약 틱·PDC·POI가 있는 청크, 로드/언로드, 20라운드 순환 전수 검사로 다시 캡처할 청크를 고릅니다. 저장 실패 후에는 다음 캡처가 전체 캡처입니다.
+
+**Scala 전환.** link-core·link-velocity·`io.linkmc.server`를 Scala 3.10.0(Java 25, LinkCore와 동일 런타임)으로 1:1 변환했습니다. 패치에서 호출하는 `NativeJournal`·`LinkRuntime`은 Java 진입점으로 남고 `LinkServerBridge`(ServiceLoader)로 Scala 구현을 호출합니다. `LinkConfiguration`·`LinkPacketGate`·`ConflictException`·`link-api`는 Java입니다. 서버 JAR은 `scala-library`·`scala3-library_3` 3.10.0을 포함하며 LinkCore가 포함한 런타임과 같은 버전입니다.
+
+**검증.** PostgreSQL 17·MariaDB 11.4 core 테스트 각 98개(S3 전용 1개 제외), Velocity 5개, 서버 Link 93개 통과. 실제 서버(Scala 빌드): 1,296개 강제 로드 청크·블록 레이어·armor stand 300개·상자 40개 상태에서 블록·상자·엔티티 변경 후 강제 종료 → 재시작 시 모두 복구(armor stand 301/301). PostgreSQL 컨테이너 20초 일시 정지 중 TPS 20.0 유지·서버 정지 없음, 장애 중 변경이 복구 후 저장되고 강제 종료 뒤에도 유지. 캡처 시간: 6,368청크 107~196ms → 증분 31~52ms(Java 빌드 측정), 200명 합성 플레이어 캡처 44~55ms. LinkCore 0.1.0-SNAPSHOT JAR을 같은 서버에 설치해 Scala 클래스 충돌(LinkageError 등) 없이 로드됨을 확인(활성화는 LinkCore DB 미설정으로 실패). 실제 200명 클라이언트 부하, 다중 백엔드 Velocity 이동, 25초를 넘는 DB 장애(소유권 보호로 정지)는 이번 검사 범위가 아닙니다.

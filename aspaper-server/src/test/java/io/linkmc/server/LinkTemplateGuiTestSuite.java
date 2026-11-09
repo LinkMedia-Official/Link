@@ -45,7 +45,7 @@ class LinkTemplateGuiTestSuite {
                 handler.click(click);verify(click).setCancelled(true);
             }
             var click=mock(InventoryClickEvent.class);when(click.getView()).thenReturn(view);when(click.getWhoClicked()).thenReturn(player);when(click.getRawSlot()).thenReturn(30);when(click.getClick()).thenReturn(ClickType.LEFT);handler.click(click);verify(click).setCancelled(true);
-            var drag=mock(InventoryDragEvent.class);when(drag.getView()).thenReturn(view);handler.drag(drag);verify(drag).setCancelled(true);verifyNoInteractions(menu.editors);
+            var drag=mock(InventoryDragEvent.class);when(drag.getView()).thenReturn(view);handler.drag(drag);verify(drag).setCancelled(true);verifyNoInteractions(menu.editors());
         }
     }
 }
