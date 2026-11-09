@@ -1,5 +1,6 @@
 name: Link package
-# dev/26.3 에 커밋이 푸시될 때마다 Link jar 를 빌드하고 Pterodactyl 서버 이미지를 GHCR 에 올린다.
+# dev/26.3 에 커밋이 푸시될 때마다 Link jar 를 빌드하고, link-api 를 GitHub Packages(Maven)에,
+# Pterodactyl 서버 이미지를 GHCR 에 올린다.
 on:
   push:
     branches: ['dev/26.3']
@@ -26,6 +27,10 @@ jobs:
       - run: git config --global user.name Link-CI && git config --global user.email link-ci@localhost
       - run: bash gradlew applyAllPatches --console=plain
       - run: bash gradlew linkDist --console=plain
+      - name: Publish link-api to GitHub Packages (Maven)
+        run: bash gradlew :link-api:publishLinkApiPublicationToGitHubPackagesRepository --console=plain
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Short SHA / owner
         run: |
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
