@@ -23,7 +23,10 @@ private[server] final class LinkTemplateGui extends Listener {
             if (!(event.getRawSlot() < 0 || event.getRawSlot() >= 27 || !((event.getClick() eq ClickType.LEFT) || (event.getClick() eq ClickType.RIGHT) || (menu.page.equals("channels") && event.getRawSlot() == 10 && event.isShiftClick())))) {
               val slot = event.getRawSlot(); val right = (event.getClick() eq ClickType.RIGHT) || (event.getClick() eq ClickType.SHIFT_RIGHT); val large = event.isShiftClick()
               // Inventory replacement/teleport must happen after the current inventory event.
-              Bukkit.getScheduler().runTask(OWNER, () => act(player, menu, slot, right, large))
+              // Typed as Runnable: Scala 3 would otherwise SAM-convert the lambda to BukkitRunnable and pick the
+              // deprecated runTask(Plugin, BukkitRunnable) overload, which always throws.
+              val task: Runnable = () => act(player, menu, slot, right, large)
+              Bukkit.getScheduler().runTask(OWNER, task)
             }
           case _ =>
         }
@@ -143,13 +146,14 @@ object LinkTemplateGui {
       val position = p.getLocation()
       val result = menu.editors.configure(p.getUniqueId(), menu.world, (w: World) => { if (page.equals("channels")) channelChange(w, slot, right, large) else if (page.equals("protection")) LinkWorldProtection.set(w, LinkWorldProtection.policy(w).toggle(LinkWorldProtection.Rule.values(slot - 9))) else change(w, slot, right, position) })
       result.whenComplete((v: Void, error: Throwable) => {
-        Bukkit.getScheduler().runTask(OWNER, () => {
+        val task: Runnable = () => {
           if (error != null) LinkCommand.report(p, java.util.concurrent.CompletableFuture.failedFuture[AnyRef](error), "")
           else {
             p.sendMessage("템플릿 작업 설정을 저장했습니다. 발행본 반영은 /템플릿 저장을 사용하세요.")
             if (p.isOnline() && (p.getOpenInventory().getTopInventory() eq menu.inventory)) { try render(menu, LinkEditors.editable(p, menu.world)) catch { case e: LinkEditors.EditorError => p.closeInventory() } }
           }
-        })
+        }
+        Bukkit.getScheduler().runTask(OWNER, task)
         ()
       })
     } catch { case error: LinkEditors.EditorError => p.sendMessage(error.getMessage()); p.closeInventory() }
