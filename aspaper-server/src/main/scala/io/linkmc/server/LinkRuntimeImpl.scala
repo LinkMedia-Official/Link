@@ -1,22 +1,17 @@
 package io.linkmc.server
 
-import com.infernalsuite.asp.api.SlimeNMSBridge
 import io.linkmc.api.LinkApi
-import io.linkmc.api.LinkApi.{Data, Destination, Editors, Engine, Network, Session, Sessions, Teleports, Utilities, WarpGroups, Worlds}
-import io.linkmc.core.{ConflictException, Database, EventRetention, EventStore, LinkService, NetworkStore, RedisOutbox, RouteStore, RuntimeProvider, SessionStore, SpawnProvisioner, TemplateStore, WorldService}
+import io.linkmc.api.LinkApi.{Data, Destination, Engine, Network, Session, Sessions, Teleports, Utilities}
+import io.linkmc.core.{ConflictException, Database, EventRetention, LinkService, NetworkStore, RedisOutbox, RouteStore, RuntimeProvider, SessionStore}
 import java.util.concurrent.{CompletableFuture, CompletionStage, Executors, ScheduledExecutorService, TimeUnit}
 
 /** Native bootstrap; tooling mode is explicitly NOT a durable gameplay implementation. */
 final class LinkRuntimeImpl private (db: Database, node0: String) extends LinkApi {
   private val notifications: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Link-Notifications").factory())
   private val maintenance: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Link-Retention").factory())
-  private var provisioner: SpawnProvisioner = null
-  private var templateEditor: Boolean = false
-  private var bootstrapWorld: String = "link-spawn"
   private val heartbeat: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("Link-Heartbeat").factory())
   private var redis: RedisOutbox = null
   private var teleportRuntime: LinkTeleportRuntime = null
-  private var groupRuntime: LinkGroupRuntime = null
   @volatile private var closing: Boolean = false
 
   private val database: Database = db
@@ -26,11 +21,8 @@ final class LinkRuntimeImpl private (db: Database, node0: String) extends LinkAp
   @volatile private var nodeLease: Session = if (NativeJournalImpl.enabled()) NativeJournalImpl.startupOwner() else leases.acquireNode(node)
   db.nodeOwner(() => nodeLease)
   private val service: LinkService = new LinkService(db, (route: RouteStore.Request) => NativeJournalImpl.submitRoute(route))
-  private val driver: LinkWorldDriver = new LinkWorldDriver(new EventStore(db), nodeLease, node, db.worldBlobs(), networkStore)
-  private val worldService: WorldService = new WorldService(driver, new TemplateStore(db))
-  private val editorService: LinkEditors = new LinkEditors(worldService)
 
-  private def fenceWorkers(): Unit = { closing = true; try { if (teleportRuntime != null) teleportRuntime.close() } finally { if (groupRuntime != null) groupRuntime.close() } }
+  private def fenceWorkers(): Unit = { closing = true; if (teleportRuntime != null) teleportRuntime.close() }
   private def deliverNotifications(uri: String): Unit = this.synchronized {
     if (!closing) {
       try {
@@ -59,10 +51,8 @@ final class LinkRuntimeImpl private (db: Database, node0: String) extends LinkAp
     var saved = false
     try {
       if (teleportRuntime != null) teleportRuntime.close()
-      if (groupRuntime != null) groupRuntime.close()
       notifications.shutdownNow(); maintenance.shutdownNow()
-      worldService.close()
-      if (NativeJournalImpl.enabled()) NativeJournalImpl.shutdown() else driver.saveOnShutdown()
+      if (NativeJournalImpl.enabled()) NativeJournalImpl.shutdown()
       saved = true
     } catch {
       case e: Exception =>
@@ -84,9 +74,6 @@ final class LinkRuntimeImpl private (db: Database, node0: String) extends LinkAp
   override def sessions(): Sessions = service.sessions()
   override def network(): Network = service.network()
   override def teleports(): Teleports = service.teleports()
-  override def worlds(): Worlds = worldService
-  override def editors(): Editors = editorService
-  override def warpGroups(): WarpGroups = service.warpGroups()
   override def utilities(): Utilities = new LinkUtilities()
   override def engine(): Engine = new Engine {
     override def journalEnabled(): Boolean = NativeJournalImpl.enabled()
@@ -126,20 +113,12 @@ object LinkRuntimeImpl {
     try {
       val url = config.jdbcUrl(); val user = config.username(); val password = config.password()
       val node = config.node()
-      val db = if (NativeJournalImpl.enabled()) NativeJournalImpl.database() else Database.pooled(url, user, password); if (!NativeJournalImpl.enabled()) db.worldStorage(config.worldStorage()); db.migrate()
+      val db = if (NativeJournalImpl.enabled()) NativeJournalImpl.database() else Database.pooled(url, user, password); db.migrate()
       val runtime = new LinkRuntimeImpl(db, node)
       try {
-        val template = config.template()
-        val version = config.templateVersion()
-        val published = new TemplateStore(db).find(template, version)
-        runtime.templateEditor = published.isEmpty()
-        if (runtime.templateEditor) {
-          runtime.bootstrapWorld = "link-template-editor"
-          SlimeNMSBridge.instance().setDefaultWorlds(runtime.driver.bootstrapEditor(runtime.bootstrapWorld), null, null)
-          net.minecraft.server.MinecraftServer.LOGGER.warn("Spawn template {}:{} is missing. Opening link-template-editor. Build here, run /link publish link-template-editor {} {}, then restart.", template, Integer.valueOf(version), template, Integer.valueOf(version))
-        } else {
-          SlimeNMSBridge.instance().setDefaultWorlds(runtime.driver.bootstrap("link-spawn", NativeJournalImpl.worldOrTemplate("link-spawn", published.get())), null, null)
-        }
+        // Worlds are plain vanilla worlds: Paper loads level-name (and its nether/end) as usual.
+        // Exported worlds an older build kept in the database must exist on disk before Paper reads world data.
+        LinkWorldExport.beforeWorlds()
         instance = runtime; RuntimeProvider.install(runtime)
         val lastRenewed = Array[Long](System.nanoTime())
         runtime.heartbeat.scheduleWithFixedDelay(() => {
@@ -163,7 +142,6 @@ object LinkRuntimeImpl {
               if (!runtime.closing) {
                 if (NativeJournalImpl.enabled()) {
                   try { runtime.networkStore.heartbeat(node, config.nodeCapacity()) } catch { case networkError: Exception => net.minecraft.server.MinecraftServer.LOGGER.warn("Link network heartbeat deferred; node lease renewed", networkError) }
-                  if (runtime.provisioner != null) runtime.provisioner.ensureSpare().whenComplete((created: java.lang.Boolean, error: Throwable) => { if (error != null) net.minecraft.server.MinecraftServer.LOGGER.error("Link spawn provisioning failed", error) })
                 }
               }
             }
@@ -177,46 +155,27 @@ object LinkRuntimeImpl {
       } catch { case e: Exception => runtime.close(); throw e }
     } catch { case e: Exception => throw new IllegalStateException("Link bootstrap failed", e) }
   }
-  def managesWorlds(): Boolean = instance != null
   def afterWorlds(): Unit = {
     if (instance == null) return
     val runtime = instance
     val config = LinkConfiguration.get()
     try {
-      if (runtime.templateEditor) runtime.driver.prepareBootstrapEditor(runtime.bootstrapWorld)
       if (NativeJournalImpl.enabled()) {
-        val recovered = NativeJournalImpl.recoveredWorlds().iterator()
-        while (recovered.hasNext) { val name = recovered.next(); if (!name.equals(runtime.bootstrapWorld)) runtime.driver.restoreNative(name, NativeJournalImpl.recoveredWorld(name)) }
-        net.minecraft.server.MinecraftServer.getServer().linkRestoreSavedData()
+        LinkWorldExport.afterWorlds()
+        LinkWorldExport.autoload(config.autoloadWorlds())
         NativeJournalImpl.activate()
         runtime.networkStore.heartbeat(runtime.node, config.nodeCapacity())
         runtime.networkStore.reconcileNode(runtime.nodeLease)
-        runtime.networkStore.syncWarpWorlds(runtime.node, runtime.driver.loadedNames())
-        val loadedWorlds = org.bukkit.Bukkit.getWorlds().iterator()
-        while (loadedWorlds.hasNext) {
-          val world = loadedWorlds.next()
-          if (if (runtime.templateEditor) world.getName().equals(runtime.bootstrapWorld) else (world.getName().equals("link-spawn") || world.getName().startsWith("spawn-"))) {
-            val pos = LinkTemplateGui.spawn(world)
-            runtime.networkStore.register(runtime.node + ":" + world.getName(), new Destination(runtime.node, world.getName(), pos.getX(), pos.getY(), pos.getZ(), pos.getYaw(), pos.getPitch()), config.worldCapacity())
-          }
-        }
-        if (!runtime.templateEditor) runtime.provisioner = new SpawnProvisioner(runtime.worldService, runtime.networkStore, runtime.node, config.template(), config.templateVersion(), config.worldCapacity(), config.maxWorlds())
+        // First joins are allocated to a node's main world; players then spawn where vanilla places them.
+        val main = org.bukkit.Bukkit.getWorlds().getFirst(); val spawn = main.getSpawnLocation()
+        runtime.networkStore.register(runtime.node + ":" + main.getName(), new Destination(runtime.node, main.getName(), spawn.getX(), spawn.getY(), spawn.getZ(), spawn.getYaw(), spawn.getPitch()), config.nodeCapacity())
+        runtime.networkStore.syncWarpWorlds(runtime.node, org.bukkit.Bukkit.getWorlds().stream().map[String](w => w.getName()).toList())
+        LinkWorldEvents.register(runtime.networkStore, runtime.node)
       }
       val redisUri = config.redisUri()
       if (redisUri != null && !redisUri.isBlank()) runtime.notifications.scheduleWithFixedDelay(() => runtime.deliverNotifications(redisUri), 0, 5, TimeUnit.SECONDS)
-      val completions = new LinkCompletions(() => runtime.driver.loadedNames(), () => runtime.driver.editableNames(), config.template())
-      runtime.notifications.scheduleWithFixedDelay(() => {
-        try { completions.refresh(runtime.database, runtime.node) }
-        catch { case error: Exception => net.minecraft.server.MinecraftServer.LOGGER.debug("Link completion catalog refresh failed", error) }
-      }, 0, 2, TimeUnit.SECONDS)
-      LinkTemplateGui.register(); LinkWorldProtection.register()
       LinkUtilityCommand.register(runtime.utilities())
-      LinkCommand.register(runtime, completions)
-      LinkTravelCommand.register(runtime, completions)
-      org.bukkit.Bukkit.getCommandMap().register("link", new LinkWarpGroupCommand(runtime, completions, runtime.node))
-      LinkWarpCommand.register(runtime.network(), runtime.node, config.worldCapacity(), completions)
       if (NativeJournalImpl.enabled()) {
-        runtime.groupRuntime = new LinkGroupRuntime(runtime.database, runtime.worldService, runtime.node, () => runtime.nodeLease); runtime.groupRuntime.start()
         runtime.teleportRuntime = new LinkTeleportRuntime(runtime.database, runtime.service, runtime.node, config.worldCapacity())
         LinkTeleportCommand.register(runtime.teleports(), runtime.teleportRuntime); runtime.teleportRuntime.start()
       }
@@ -224,7 +183,7 @@ object LinkRuntimeImpl {
         net.minecraft.server.MinecraftServer.LOGGER.info("Link event retention enabled: {} hours; latest state/transaction anchors retained", Integer.valueOf(config.retentionHours()))
         runtime.maintenance.scheduleWithFixedDelay(() => runtime.pruneEvents(config), config.retentionInterval(), config.retentionInterval(), TimeUnit.SECONDS)
       }
-    } catch { case e: Exception => throw new IllegalStateException("Link world activation failed", e) }
+    } catch { case e: Exception => throw new IllegalStateException("Link activation failed", e) }
   }
   def stop(): Unit = synchronized { val runtime = instance; if (runtime != null) { runtime.closing = true; RuntimeProvider.uninstall(runtime); try { runtime.close() } finally { instance = null } } }
   private[server] def isClosing(): Boolean = { val runtime = instance; val server = net.minecraft.server.MinecraftServer.getServer(); runtime == null || runtime.closing || (server != null && server.hasStopped()) }

@@ -54,7 +54,8 @@ final class ArrivalStore(db: Database) {
           val owner: Session = if (transfer == null) sessions.acquire(c, player, node) else sessions.accept(c, player, transfer, node)
           val destination: Destination = network.admit(c, r.getObject("reservation", classOf[UUID]), owner)
           update(c, "UPDATE link_arrivals SET state='CLAIMED',epoch=? WHERE id=?", owner.epoch(), ticket)
-          ArrivalStore.Arrival(ticket, owner, destination)
+          // Only a cross-server hand-off carries a position; a fresh join uses the player's saved position.
+          ArrivalStore.Arrival(ticket, owner, destination, transfer != null)
         }
       }
     }
@@ -76,5 +77,6 @@ final class ArrivalStore(db: Database) {
 }
 
 object ArrivalStore {
-  final case class Arrival(ticket: UUID, session: Session, destination: Destination)
+  /** {@code fixed}: the player must be placed at {@code destination} (travel); otherwise vanilla placement applies. */
+  final case class Arrival(ticket: UUID, session: Session, destination: Destination, fixed: Boolean)
 }

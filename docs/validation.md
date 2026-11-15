@@ -1,5 +1,17 @@
 # 검증 결과
 
+> 아래 2026-11-15 이전 기록 중 템플릿·워프·스폰 채널·청크 체크포인트·SlimeVault 월드 저장에 관한 항목은 제거된 기능에 대한 기록입니다.
+
+## 2026-11-15 바닐라 월드 전환
+
+- 월드를 바닐라 파일 저장으로 전환하고 워프·`/spawn`·템플릿·`/link` 관리 명령·Link 관리 Slime 월드·청크 체크포인트를 제거했습니다.
+- 서버 Link 단위 테스트 33개 통과. `LinkWorldExportTestSuite`는 합성한 Slime 청크를 바닐라 region·entities 파일로 내보낸 뒤 다시 읽어 내용을 확인합니다.
+- PostgreSQL 17 core 테스트 82개 통과(S3 전용 1개 제외), Velocity 테스트 통과. `applyAllPatches` 재적용과 `linkDist` 빌드 성공.
+- 실제 서버 전환 시험(이전 빌드로 만든 PostgreSQL DB, 노드 `test-a`):
+  - 첫 시작: `Link vanilla export: 2 world(s), 50 chunk(s)`. island-test(0,100,0 다이아몬드 블록)와 link-template-editor(0,102,0 금 블록)가 `world/dimensions/minecraft/<이름>/region`으로 내보내졌고, 두 블록 모두 `execute if block`으로 확인했습니다. 직전에 열려 있던 두 월드가 `worlds.autoload`에 추가됐습니다.
+  - 정상 종료 후 재시작: 다시 내보내지 않았고, autoload로 두 월드가 열렸습니다. 변환 뒤에 놓은 청금석 블록(바닐라 저장)과 기존 두 블록이 유지됐고 `save-all`이 성공했습니다.
+  - 확인하지 않은 것: `/tpa` 서버 간 이동(백엔드 2대), 실제 플레이어 접속, SlimeVault에 저장된 월드의 내보내기, 크래시 후 상자·인벤토리 시점 차이.
+
 ## 비동기 자동 저장·멀티스레드 검증 (2026-11-03)
 
 - PostgreSQL·MariaDB core 테스트 각각 75개 통과(전용 S3 통합 테스트 1개 제외), 서버 Link 테스트 92개 통과. 최종 linkDist 성공. 추가 NMS save-all 패치는 생성된 소스에 대한 reverse apply 검사를 통과했습니다.

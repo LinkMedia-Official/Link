@@ -4,9 +4,7 @@ import io.linkmc.api.LinkApi.Destination
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.network.Connection
 import net.minecraft.server.level.ServerPlayer
-import net.minecraft.world.level.storage.SavedDataStorage
 
-import java.nio.file.Path
 import java.util.{Optional, UUID}
 import java.util.concurrent.CompletableFuture
 import java.util.function.BooleanSupplier
@@ -29,14 +27,10 @@ final class LinkServerImpl extends LinkServerBridge {
   override def left(player: ServerPlayer): Unit = NativeJournalImpl.left(player)
   override def stats(id: UUID): com.google.gson.JsonElement = NativeJournalImpl.stats(id)
   override def advancements(id: UUID): com.google.gson.JsonElement = NativeJournalImpl.advancements(id)
-  override def savedData(storage: SavedDataStorage, path: Path, id: String): Optional[CompoundTag] = NativeJournalImpl.savedData(storage, path, id)
-  override def seedStorage(world: String, seed: CompoundTag): Unit = NativeJournalImpl.seedStorage(world, seed)
-  override def registerStorage(storage: SavedDataStorage, path: Path): Unit = NativeJournalImpl.registerStorage(storage, path)
   override def saveAsync(): CompletableFuture[Void] = NativeJournalImpl.saveAsync()
   // LinkRuntime
   override def beforeWorlds(): Unit = LinkRuntimeImpl.beforeWorlds()
   override def afterWorlds(): Unit = LinkRuntimeImpl.afterWorlds()
   override def beginShutdown(): Unit = LinkRuntimeImpl.beginShutdown()
   override def stop(): Unit = LinkRuntimeImpl.stop()
-  override def managesWorlds(): Boolean = LinkRuntimeImpl.managesWorlds()
 }

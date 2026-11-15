@@ -26,25 +26,9 @@ public interface LinkApi {
         CompletionStage<List<String>> onlinePlayers();
     }
     record TeleportRequest(UUID id,UUID requester,String requesterName,UUID recipient,String recipientName,boolean here,String state,Instant expiresAt){}
-    /** Available on a Link backend; proxies only expose data/session/network services. */
-    default Worlds worlds() { throw new IllegalStateException("No world engine on this node"); }
+    /** Available on a Link backend; proxies only expose data/session/network services. Worlds are plain Bukkit worlds. */
     default Engine engine() { throw new IllegalStateException("No native engine on this node"); }
-    default Editors editors() { throw new IllegalStateException("No template editor on this node"); }
     default Utilities utilities() { throw new IllegalStateException("No player utilities on this node"); }
-    default WarpGroups warpGroups() { throw new IllegalStateException("No warp group service"); }
-    record ChannelPolicy(int capacity,int maxChannels,boolean autoExpand,boolean networkWide) {
-        public ChannelPolicy {if(capacity<1||capacity>1000||maxChannels<1||maxChannels>100)throw new IllegalArgumentException("Channel limits out of range");}
-        public static ChannelPolicy defaults(){return new ChannelPolicy(50,3,true,false);}
-    }
-    record WarpGroup(String name,String template,int version,String homeNode,ChannelPolicy policy){}
-    interface WarpGroups {
-        CompletionStage<Void> bind(String name,String template,int version,String homeNode);
-        CompletionStage<List<WarpGroup>> list();
-        CompletionStage<List<Channel>> channels(String name);
-        CompletionStage<String> status(UUID operation);
-        /** Queues a group warp or submits an existing fixed warp. The UUID is the travel operation. */
-        CompletionStage<Void> travel(UUID player,UUID operation,String name);
-    }
     enum MovementMode { AUTO, WALK, FLY }
     /** Backend-only; callers must authorize the target UUID. Completion follows the native commit. */
     interface Utilities {
@@ -53,18 +37,6 @@ public interface LinkApi {
         CompletionStage<Void> flight(UUID player, Boolean enabled);
         CompletionStage<Void> heal(UUID player);
         CompletionStage<Void> feed(UUID player);
-    }
-
-    /** Backend-only editing excursions. Implementations retain the original return position. */
-    interface Editors {
-        /** Opens the backend settings GUI for the player's active template workspace. */
-        default CompletionStage<Void> openSettings(UUID player) { throw new UnsupportedOperationException(); }
-        CompletionStage<WorldInfo> create(UUID player, String workspace);
-        CompletionStage<WorldInfo> edit(UUID player, String template, int version);
-        CompletionStage<Void> enter(UUID player, String workspace);
-        CompletionStage<Void> save(UUID player, String template, int version, boolean exit);
-        /** Saves the working world and returns; does not publish a template version. */
-        CompletionStage<Void> exit(UUID player);
     }
 
     interface Engine {
@@ -77,22 +49,6 @@ public interface LinkApi {
          */
         CompletionStage<Void> transact(Runnable mutation);
     }
-
-    interface Worlds {
-        default CompletionStage<WorldInfo> ensurePersistent(String name,String template,int version){throw new UnsupportedOperationException();}
-        /** Resolves the loaded world's template spawn, including exact position and view. */
-        default CompletionStage<Destination> spawn(String name) { throw new UnsupportedOperationException(); }
-        CompletionStage<List<String>> templates();
-        CompletionStage<WorldInfo> createEditor(String name);
-        CompletionStage<Void> publish(String editor, String template, int version);
-        CompletionStage<WorldInfo> create(String name, String template, int version, boolean persistent);
-        CompletionStage<WorldInfo> load(String name);
-        CompletionStage<Void> save(String name);
-        CompletionStage<Void> unload(String name);
-        CompletionStage<Void> delete(String name);
-        CompletionStage<List<WorldInfo>> loaded();
-    }
-    record WorldInfo(String name, boolean persistent, int players) {}
 
     interface Data {
         CompletionStage<Optional<State>> read(String id);
@@ -115,18 +71,10 @@ public interface LinkApi {
 
     interface Network {
         CompletionStage<List<Channel>> channels();
-        CompletionStage<Void> registerChannel(String id, Destination spawn, int capacity);
-        CompletionStage<Void> setChannelReady(String id, boolean ready);
         CompletionStage<Reservation> reserve(UUID player, UUID request);
         CompletionStage<Reservation> reserve(UUID player, UUID request, Destination destination);
         CompletionStage<Void> cancel(UUID reservation, UUID player);
-        CompletionStage<Optional<Destination>> warp(String name);
-        CompletionStage<Void> setWarp(String name, Destination destination);
-        /** Registers a loaded destination world for warp travel without making it a public spawn. */
-        CompletionStage<Void> setWarp(String name, Destination destination, int capacity);
-        CompletionStage<Boolean> deleteWarp(String name);
-        CompletionStage<List<String>> warps();
-        /** Enqueues native source checkpoint and proxy travel; null destination allocates a spawn. */
+        /** Enqueues native source checkpoint and proxy travel to an explicit, loaded destination world. */
         CompletionStage<Reservation> requestTravel(UUID player, UUID operation, Destination destination);
         /** REQUESTED, READY, CONNECTING, COMPLETE, FAILED or MISSING. */
         CompletionStage<String> travelStatus(UUID operation);
@@ -184,12 +132,6 @@ public interface LinkApi {
     record Channel(String id, String node, String world, int capacity, int occupied, int reserved) {}
     record Reservation(UUID id, UUID player, String channel, Destination destination, Instant expiresAt) {}
 
-    /** Stable bounded event aggregate identifier, including for 160-character warp names. */
-    static String warpStateId(String name){
-        requireName(name);
-        try{return "warp:"+java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(name.getBytes(java.nio.charset.StandardCharsets.UTF_8)));}
-        catch(java.security.NoSuchAlgorithmException error){throw new AssertionError(error);}
-    }
     static void requireName(String value) {
         if (value == null || !value.matches("[A-Za-z0-9_./:-]{1,160}") || value.contains(".."))
             throw new IllegalArgumentException("Invalid Link identifier");

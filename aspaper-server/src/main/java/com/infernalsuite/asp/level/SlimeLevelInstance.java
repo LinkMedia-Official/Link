@@ -115,21 +115,14 @@ public class SlimeLevelInstance extends ServerLevel {
                     .getOrThrow();
         }
 
-        if(io.linkmc.server.NativeJournal.enabled() && initialExtraData.containsKey("LinkSavedData")) {
-            io.linkmc.server.NativeJournal.seedStorage(slimeBootstrap.initial().getName(), (CompoundTag)Converter.convertTag(initialExtraData.get("LinkSavedData")));
-        }
-        var durableStorage = new ReadOnlyDimensionDataStorage(io.linkmc.server.NativeJournal.enabled() ? Path.of("link-saved-worlds", slimeBootstrap.initial().getName()) : CUSTOM_LEVEL_STORAGE_ACCESS.getDimensionPath(dimensionKey), MinecraftServer.getServer().getFixerUpper(), MinecraftServer.getServer().registryAccess());
-        var restoredOverrides = io.linkmc.server.NativeJournal.enabled() ? durableStorage.get(PaperLevelOverrides.TYPE) : null;
-        var restoredMetadata = io.linkmc.server.NativeJournal.enabled() ? durableStorage.get(io.papermc.paper.world.saveddata.PaperWorldMetadata.TYPE) : null;
         final PaperWorldLoader.LoadedWorldData data = new PaperWorldLoader.LoadedWorldData(
                 slimeBootstrap.initial().getName(),
-                restoredMetadata == null ? UUID.randomUUID() : restoredMetadata.uuid(),
+                UUID.randomUUID(),
                 pdc,
-                restoredOverrides == null ? PaperLevelOverrides.createFromLiveLevelData(primaryLevelData) : restoredOverrides
+                PaperLevelOverrides.createFromLiveLevelData(primaryLevelData)
         );
 
         SlimePropertyMap propertyMap = slimeBootstrap.initial().getPropertyMap();
-        if (restoredOverrides == null) {
         data.levelOverrides().setSpawn(
                 new LevelData.RespawnData(
                         GlobalPos.of(
@@ -145,7 +138,6 @@ public class SlimeLevelInstance extends ServerLevel {
                 )
         );
         data.levelOverrides().setDifficulty(Difficulty.valueOf(propertyMap.getValue(SlimeProperties.DIFFICULTY).toUpperCase()));
-        }
         data.levelOverrides().attach(primaryLevelData, dimensionKey);
         data.levelOverrides().setInitialized(true);
 
@@ -167,7 +159,7 @@ public class SlimeLevelInstance extends ServerLevel {
                 environment,
                 null,
                 null,
-                durableStorage,
+                new ReadOnlyDimensionDataStorage(CUSTOM_LEVEL_STORAGE_ACCESS.getDimensionPath(dimensionKey), MinecraftServer.getServer().getFixerUpper(), MinecraftServer.getServer().registryAccess()),
                 data
         );
         this.isFlat = slimeBootstrap.initial().getPropertyMap().getValue(SlimeProperties.WORLD_TYPE).equalsIgnoreCase("flat");
@@ -177,7 +169,7 @@ public class SlimeLevelInstance extends ServerLevel {
         super.getChunkSource().setSpawnSettings(propertyMap.getValue(SlimeProperties.ALLOW_MONSTERS), propertyMap.getValue(SlimeProperties.ALLOW_ANIMALS));
 
 
-        if (restoredOverrides == null) propertyMap.getOptionalValue(SlimeProperties.PVP)
+        propertyMap.getOptionalValue(SlimeProperties.PVP)
                 .ifPresent(val -> getGameRules().set(GameRules.PVP, val, this));
 
         this.entityDataController = new SlimeEntityDataLoader(

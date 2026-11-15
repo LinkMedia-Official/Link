@@ -1,7 +1,6 @@
 package io.linkmc.server;
 
 import io.linkmc.api.LinkApi.Destination;
-import java.nio.file.Path;
 import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.UUID;
@@ -10,7 +9,6 @@ import java.util.function.BooleanSupplier;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.Connection;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.level.storage.SavedDataStorage;
 
 /**
  * The only way Java (patched Minecraft/Paper code) reaches the Scala implementation of Link's server runtime.
@@ -34,16 +32,12 @@ public interface LinkServerBridge {
     void left(ServerPlayer player);
     com.google.gson.JsonElement stats(UUID id);
     com.google.gson.JsonElement advancements(UUID id);
-    Optional<CompoundTag> savedData(SavedDataStorage storage, Path path, String id);
-    void seedStorage(String world, CompoundTag seed);
-    void registerStorage(SavedDataStorage storage, Path path);
     CompletableFuture<Void> saveAsync();
     // LinkRuntime
     void beforeWorlds();
     void afterWorlds();
     void beginShutdown();
     void stop();
-    boolean managesWorlds();
 
     static LinkServerBridge load() {
         return ServiceLoader.load(LinkServerBridge.class, LinkServerBridge.class.getClassLoader()).findFirst()

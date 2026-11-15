@@ -23,7 +23,6 @@ public class ReadOnlyDimensionDataStorage extends SavedDataStorage {
 
     @Override
     public @Nullable <T extends SavedData> T get(SavedDataType<T> type) {
-        if(io.linkmc.server.NativeJournal.enabled())return super.get(type);
         Optional<SavedData> optional = this.cache.get(type);
         if(optional == null) {
             return null;

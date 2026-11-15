@@ -20,7 +20,7 @@ final class RouteStore(db: Database) {
         if (!reservation.player().equals(player) || (destination != null && !destination.equals(reservation.destination()))) throw new ConflictException("Route ID reused")
         reservation
       } else {
-        val reservation = new NetworkStore(db).reserve(c, player, id, destination, null)
+        val reservation = new NetworkStore(db).reserve(c, player, id, destination)
         request(c, id, reservation); reservation
       }
     }

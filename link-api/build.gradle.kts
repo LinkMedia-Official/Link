@@ -4,7 +4,7 @@ plugins {
 }
 group = "io.linkmc"
 // CI 는 LINK_API_VERSION 으로 버전을 정할 수 있다. 기본값은 커밋마다 덮어쓰는 SNAPSHOT.
-version = providers.environmentVariable("LINK_API_VERSION").getOrElse("0.1.0-SNAPSHOT")
+version = providers.environmentVariable("LINK_API_VERSION").getOrElse("0.2.0-SNAPSHOT")
 java { withSourcesJar(); withJavadocJar() }
 publishing {
     publications.create<MavenPublication>("linkApi") {

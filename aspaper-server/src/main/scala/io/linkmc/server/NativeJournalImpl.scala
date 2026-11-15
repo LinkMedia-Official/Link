@@ -1,6 +1,5 @@
 package io.linkmc.server
 
-import com.infernalsuite.asp.api.SlimeNMSBridge
 import io.linkmc.api.LinkApi.{Destination, Session, State, Transaction}
 import io.linkmc.core.{ArrivalStore, AsyncSavePipeline, ConflictException, Database, EventStore, FrameCommitter, RouteStore, SaveProgress, SessionStore, TeleportStore}
 import net.minecraft.nbt.CompoundTag
@@ -60,8 +59,6 @@ object NativeJournalImpl {
   private[server] def database(): Database = instance.db
   private[server] def finishStartup(): Unit = { if (startupRenewal != null) { startupRenewal.shutdownNow(); startupRenewal = null } }
 
-  private final case class CapturedWorld(key: String, world: com.infernalsuite.asp.api.world.SlimeWorld, carried: java.util.Set[String])
-  private val INCREMENTAL: Boolean = !java.lang.Boolean.getBoolean("link.incrementalCapture.disabled")
   private final case class PendingRemote(route: RouteStore.Request, owner: Session)
   private val RETRY_NANOS: Long = TimeUnit.SECONDS.toNanos(5)
 
@@ -168,85 +165,19 @@ object NativeJournalImpl {
     run(() => { try flush() catch { case e: Exception => throw new IllegalStateException(e) } })
   }
 
-  def savedData(storage: net.minecraft.world.level.storage.SavedDataStorage, path: java.nio.file.Path, id: String): Optional[CompoundTag] = {
-    val j = instance; val key = j.storageKey(path); j.storages.put(key, storage)
-    val saved = j.frames.state(key + "/" + id).map[CompoundTag](state => {
-      try NativePlayerCodec.decode(state.payload()) catch { case e: Exception => throw new IllegalStateException("Invalid durable saved data", e) }
-    })
-    if (saved.isPresent()) return saved
-    val migrated = j.restored.get(key + "/" + id)
-    if (migrated != null) {
-      try return Optional.of(NativePlayerCodec.decode(migrated)) catch { case e: Exception => throw new IllegalStateException("Invalid migrated saved data", e) }
-    }
-    Optional.ofNullable(j.storageSeeds.get(key)).flatMap[CompoundTag](seed => seed.getCompound(id)).map[CompoundTag](tag => tag.copy())
+  // ── Archive of worlds checkpointed by older builds (read once by LinkWorldExport) ─────────────────────
+  private[server] final case class Archive(node: String, states: java.util.Map[String, Array[Byte]], catalog: java.util.Map[String, java.lang.Byte], blobs: io.linkmc.core.WorldBlobs)
+  /** Null once the vanilla export has been committed: nothing to export and nothing was loaded. */
+  private[server] def archive(): Archive = {
+    val j = instance
+    if (j == null || j.exported) null else Archive(j.node, java.util.Collections.unmodifiableMap(j.restored), java.util.Collections.unmodifiableMap(j.catalog), j.db.worldBlobs())
   }
-  def seedStorage(world: String, seed: CompoundTag): Unit = { if (enabled()) instance.storageSeeds.put(instance.storageKey(java.nio.file.Path.of("link-saved-worlds", world)), seed.copy()) }
-  def registerStorage(storage: net.minecraft.world.level.storage.SavedDataStorage, path: java.nio.file.Path): Unit = { if (enabled()) instance.storages.put(instance.storageKey(path), storage) }
-
+  /** Commits the one-time export marker and drops the archived world data from memory. Server thread, startup. */
   @throws[Exception]
-  private def snapshot(name: String): Optional[Array[Byte]] = {
-    instance.finishSave(true)
-    LinkChunkSnapshots.restore(name, instance.worldKey(name), instance.db.worldBlobs(), instance.restored)
-  }
-  @throws[Exception]
-  private[server] def worldOrTemplate(name: String, template: Array[Byte]): Array[Byte] = {
-    if (!enabled()) return template
-    instance.catalog.putIfAbsent(name, java.lang.Byte.valueOf(0.toByte))
-    // Temporary worlds are never checkpointed: always start from the template, ignoring any snapshot an older build left.
-    if (temporaryWorld(name)) template else snapshot(name).orElse(template)
-  }
-  private[server] def createdWorld(name: String, persistent: Boolean): Unit = {
-    if (enabled()) {
-      val previous: java.lang.Byte = instance.catalog.putIfAbsent(name, java.lang.Byte.valueOf((if (persistent) 1 else 0).toByte))
-      if (previous != null) throw ConflictException.worldExists(name, previous.byteValue() == 2)
-    }
-  }
-  private[server] def requireNewWorld(name: String): Unit = {
-    if (knownWorld(name)) throw ConflictException.worldExists(name, Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(2.toByte)))
-  }
-  private[server] def knownWorld(name: String): Boolean = enabled() && instance.catalog.containsKey(name)
-  private[server] def storedWorldExists(name: String): Boolean = knownWorld(name) && !Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(2.toByte))
-  private[server] def persistentWorld(name: String): Boolean = enabled() && Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(1.toByte))
-  /** Explicitly created as temporary (spawn copies of a template). Worlds Link does not know are NOT temporary. */
-  private[server] def temporaryWorld(name: String): Boolean = enabled() && Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(0.toByte))
-  @throws[Exception]
-  private[server] def storedWorld(name: String): Array[Byte] = {
-    if (!instance.catalog.containsKey(name) || Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(2.toByte))) throw new ConflictException("Unknown or deleted world")
-    snapshot(name).orElseThrow[ConflictException](() => new ConflictException("World has no committed snapshot"))
-  }
-  private[server] def deleteWorld(name: String): Unit = {
-    if (!knownWorld(name)) throw new ConflictException("Unknown world"); instance.catalog.put(name, java.lang.Byte.valueOf(2.toByte))
-  }
-  private[server] def recoveredWorlds(): java.util.List[String] = {
-    if (!enabled()) return java.util.List.of[String]()
-    val data = instance.restored.get("native:" + instance.node + "/worlds")
-    if (data == null) java.util.List.of[String]()
-    else Arrays.asList(new String(data, StandardCharsets.UTF_8).split("\n")*).stream().filter(n => !n.isEmpty && !temporaryWorld(n)).toList()
-  }
-  @throws[Exception]
-  private[server] def recoveredWorld(name: String): Array[Byte] = snapshot(name).orElseThrow()
-
-  /**
-   * Server thread, inside {@link #whenIdle}: copies only the committed entries of one world. Decoding and blob
-   * downloads then run off the server thread via {@link #decodeWorld}.
-   */
-  @throws[Exception]
-  private[server] def committedWorldView(name: String): java.util.Map[String, Array[Byte]] = {
-    if (!instance.catalog.containsKey(name) || Objects.equals(instance.catalog.get(name), java.lang.Byte.valueOf(2.toByte))) throw new ConflictException("Unknown or deleted world")
-    if (instance.saving != null) throw new IllegalStateException("World view requires an idle journal")
-    val key = instance.worldKey(name); val chunks = LinkChunkSnapshots.key(key)
-    val view = new HashMap[String, Array[Byte]]()
-    val it = instance.restored.entrySet().iterator()
-    while (it.hasNext) {
-      val entry = it.next()
-      if (entry.getKey.startsWith(key + "/") || entry.getKey.startsWith(chunks + "/")) view.put(entry.getKey, entry.getValue)
-    }
-    view
-  }
-  @throws[Exception]
-  private[server] def decodeWorld(name: String, view: java.util.Map[String, Array[Byte]]): Array[Byte] = {
-    val j = instance; if (j == null) throw new IllegalStateException("Link journal stopped")
-    LinkChunkSnapshots.restore(name, j.worldKey(name), j.db.worldBlobs(), view).orElseThrow[ConflictException](() => new ConflictException("World has no committed snapshot"))
+  private[server] def markExported(summary: String): Unit = {
+    val j = instance
+    j.frames.commit(java.util.List.of(j.nodeLease.get()), java.util.Map.of(j.exportKey, summary.getBytes(StandardCharsets.UTF_8)), () => ())
+    j.exported = true; j.restored.clear(); j.catalog.clear()
   }
 
   /** Starts the SQL arrival claim and player-data read in the background (called from PrepareSpawnTask's constructor). */
@@ -290,7 +221,8 @@ object NativeJournalImpl {
     if (!instance.admitted.containsKey(id)) throw new IllegalStateException("Player data requested before arrival claim")
     Optional.ofNullable(instance.playerData.get(id)).map[CompoundTag](tag => tag.copy())
   }
-  def destination(id: UUID): Destination = Objects.requireNonNull(instance.admitted.get(id), "Missing arrival").destination
+  /** Explicit cross-server destination, or null for a fresh join (vanilla placement from the saved player data). */
+  def destination(id: UUID): Destination = { val arrival = Objects.requireNonNull(instance.admitted.get(id), "Missing arrival"); if (arrival.fixed) arrival.destination else null }
   def joined(player: ServerPlayer): Unit = {
     if (!enabled()) return
     val j = instance; j.players.put(player.getUUID(), player)
@@ -325,7 +257,7 @@ object NativeJournalImpl {
         val old = entry.getValue
         if (j.freezing.contains(entry.getKey)) {
           // Hand-off SQL may have just switched this session to MOVING; either state is expected here.
-          try { val renewed = j.sessions.renew(old.session); j.admitted.replace(entry.getKey, old, new ArrivalStore.Arrival(old.ticket, renewed, old.destination)) }
+          try { val renewed = j.sessions.renew(old.session); j.admitted.replace(entry.getKey, old, old.copy(session = renewed)) }
           catch { case notActive: ConflictException => try { j.sessions.renewMoving(old.session); () } catch { case ignored: ConflictException => } }
         } else {
           try {
@@ -334,7 +266,7 @@ object NativeJournalImpl {
               if (j.admitted.remove(entry.getKey, old)) { j.connections.remove(entry.getKey, connection); j.playerData.remove(entry.getKey); j.sessions.disconnect(old.session) }
             } else {
               val renewed = j.sessions.renew(old.session)
-              j.admitted.replace(entry.getKey, old, new ArrivalStore.Arrival(old.ticket, renewed, old.destination))
+              j.admitted.replace(entry.getKey, old, old.copy(session = renewed))
             }
           } catch { case stale: ConflictException => if ((j.admitted.get(entry.getKey) eq old) && !j.moving.contains(entry.getKey)) throw stale }
         }
@@ -373,7 +305,6 @@ object NativeJournalImpl {
 
   /** Per-instance state of the original NativeJournal. */
   private final class Journal(val db: Database, val node: String, val nodeLease: java.util.function.Supplier[Session]) {
-    private[NativeJournalImpl] val chunkSnapshots: LinkChunkSnapshots = new LinkChunkSnapshots()
     private[NativeJournalImpl] val savePipeline: AsyncSavePipeline = new AsyncSavePipeline(LinkConfiguration.get().saveWorkers())
     private[NativeJournalImpl] val saveIntervalNanos: Long = TimeUnit.SECONDS.toNanos(LinkConfiguration.get().saveIntervalSeconds())
     private[NativeJournalImpl] var nextSaveNanos: Long = 0L
@@ -382,8 +313,6 @@ object NativeJournalImpl {
     private[NativeJournalImpl] var savedCompletions: java.util.List[Runnable] = java.util.List.of()
     private[NativeJournalImpl] var savedFailures: java.util.List[java.util.function.Consumer[Throwable]] = java.util.List.of()
     private[NativeJournalImpl] var savedDepartures: java.util.Set[UUID] = java.util.Set.of()
-    /** Complete capture (no carried chunks) on the first checkpoint and after any checkpoint that did not commit. */
-    private[NativeJournalImpl] var fullCapture: Boolean = true
     private[NativeJournalImpl] val restored: java.util.Map[String, Array[Byte]] = new HashMap()
     private[NativeJournalImpl] val catalog: java.util.Map[String, java.lang.Byte] = new HashMap()
     private[NativeJournalImpl] val admitted: java.util.Map[UUID, ArrivalStore.Arrival] = new ConcurrentHashMap()
@@ -398,7 +327,6 @@ object NativeJournalImpl {
     /** Remote routes claimed on the server thread, waiting for the next checkpoint to capture and freeze them. */
     private[NativeJournalImpl] val remoteRequests: java.util.Map[UUID, PendingRemote] = new LinkedHashMap()
     private[NativeJournalImpl] var savedRemote: java.util.List[PendingRemote] = java.util.List.of()
-    private[NativeJournalImpl] var savedMigrations: java.util.Map[String, Array[Byte]] = java.util.Map.of()
     /** Server-thread work that must observe the latest committed state; runs as soon as no checkpoint is in flight. */
     private[NativeJournalImpl] val afterSave: java.util.List[Runnable] = new ArrayList()
     private[NativeJournalImpl] var retryNotBefore: Long = 0L
@@ -406,10 +334,6 @@ object NativeJournalImpl {
     /** Off-thread SQL for acknowledgements that must not stall the tick. A single thread keeps their order. */
     private[NativeJournalImpl] val background: ExecutorService = Executors.newSingleThreadExecutor(Thread.ofPlatform().daemon().name("Link-Journal-IO").factory())
     private[NativeJournalImpl] val queuedRoutes: java.util.Set[UUID] = ConcurrentHashMap.newKeySet()
-    private[NativeJournalImpl] val storages: java.util.Map[String, net.minecraft.world.level.storage.SavedDataStorage] = new ConcurrentHashMap()
-    private[NativeJournalImpl] val storageSeeds: java.util.Map[String, CompoundTag] = new HashMap()
-    private[NativeJournalImpl] val storageMigrations: java.util.Map[String, Array[Byte]] = new HashMap()
-    private[NativeJournalImpl] var globalStoragePath: java.nio.file.Path = null
     private[NativeJournalImpl] val completions: java.util.List[Runnable] = new ArrayList()
     private[NativeJournalImpl] val failures: java.util.List[java.util.function.Consumer[Throwable]] = new ArrayList()
     private[NativeJournalImpl] val requests: java.util.Set[CompletableFuture[?]] = ConcurrentHashMap.newKeySet()
@@ -428,11 +352,19 @@ object NativeJournalImpl {
     private[NativeJournalImpl] val frames: FrameCommitter = new FrameCommitter((tx: Transaction) => { saveProgress.phase("sql", tx.changes().size()); store.commit(tx, () => saveProgress.advance()) })
     private[NativeJournalImpl] val sessions: SessionStore = new SessionStore(db, 30)
     private[NativeJournalImpl] val arrivals: ArrivalStore = new ArrivalStore(db)
+    /** Committed once the worlds an older build checkpointed into the database were exported to vanilla files. */
+    private[NativeJournalImpl] val exportKey: String = "native:" + node + "/vanilla-export"
+    @volatile private[NativeJournalImpl] var exported: Boolean = false
     locally {
-      val states = store.prefix("native:" + node + "/").iterator()
-      while (states.hasNext) { val state = states.next(); frames.restore(state); restored.put(state.id(), state.payload()) }
-      val prefix = "native:" + node + "/catalog/"
-      restored.forEach((key, value) => { if (key.startsWith(prefix) && value.length == 1) catalog.put(key.substring(prefix.length()), java.lang.Byte.valueOf(value(0))) })
+      val marker = store.read(exportKey)
+      if (marker.isPresent()) { frames.restore(marker.get()); exported = true }
+      else {
+        // Worlds are vanilla files now; this archive is only read by the one-time export, then dropped.
+        val states = store.prefix("native:" + node + "/").iterator()
+        while (states.hasNext) { val state = states.next(); frames.restore(state); restored.put(state.id(), state.payload()) }
+        val prefix = "native:" + node + "/catalog/"
+        restored.forEach((key, value) => { if (key.startsWith(prefix) && value.length == 1) catalog.put(key.substring(prefix.length()), java.lang.Byte.valueOf(value(0))) })
+      }
       MinecraftServer.LOGGER.info("Link asynchronous storage: interval={}s, workers={}, maximum in-flight checkpoints=1", LinkConfiguration.get().saveIntervalSeconds(), LinkConfiguration.get().saveWorkers())
     }
 
@@ -474,40 +406,10 @@ object NativeJournalImpl {
       if (saving != null) return
       if (completions.isEmpty() && departing.isEmpty() && remoteRequests.isEmpty() && System.nanoTime() < nextSaveNanos) return
       val captureStarted = System.nanoTime()
-      val capturedWorlds = new ArrayList[CapturedWorld]()
       val tags: java.util.Map[String, CompoundTag] = new TreeMap()
-      val server = MinecraftServer.getServer()
-      server.getScoreboard().storeToSaveDataIfDirty(server.getDataStorage().computeIfAbsent(net.minecraft.world.scores.ScoreboardSaveData.TYPE))
       val owners: java.util.List[Session] = new ArrayList(); owners.add(nodeLease.get())
       val snapshots: java.util.Map[String, Array[Byte]] = new TreeMap()
-      snapshots.putAll(storageMigrations)
-      storages.put("native:" + node + "/saved/global", server.getDataStorage())
-      val worldNames: java.util.List[String] = new ArrayList()
-      val worlds = Bukkit.getWorlds().iterator()
-      while (worlds.hasNext) {
-        val world = worlds.next()
-        // Temporary worlds (template copies) are rebuilt from their template after a crash: no chunk or world data
-        // capture. Their players are still saved with every checkpoint.
-        if (!temporaryWorld(world.getName())) {
-        storages.put("native:" + node + "/saved/world/" + world.getName(), world.asInstanceOf[org.bukkit.craftbukkit.CraftWorld].getHandle().getDataStorage())
-        val slime = SlimeNMSBridge.instance().getInstance(world)
-        if (slime == null) throw new IllegalStateException("Native journal only accepts slime worlds: " + world.getName())
-        worldNames.add(world.getName())
-        val frozen = chunkSnapshots.freezeIncremental(slime.asInstanceOf[com.infernalsuite.asp.api.world.SlimeWorld], fullCapture || !INCREMENTAL)
-        capturedWorlds.add(CapturedWorld(worldKey(world.getName()), frozen.changed, frozen.carried))
-        }
-      }
-      Collections.sort(worldNames); snapshots.put("native:" + node + "/worlds", String.join("\n", worldNames).getBytes(StandardCharsets.UTF_8))
-      catalog.forEach((name, state) => { snapshots.put("native:" + node + "/catalog/" + name, Array[Byte](state.byteValue())) })
-      val storageIt = storages.entrySet().iterator()
-      while (storageIt.hasNext) {
-        val storage = storageIt.next()
-        val entryIt = storage.getValue.linkSnapshot().entrySet().iterator()
-        while (entryIt.hasNext) {
-          val entry = entryIt.next()
-          tags.put(storage.getKey + "/" + entry.getKey, entry.getValue.copy())
-        }
-      }
+      // Worlds and their saved data are vanilla files (autosave / save-all). A checkpoint holds player state only.
       val playerIt = players.entrySet().iterator()
       while (playerIt.hasNext) {
         val entry = playerIt.next()
@@ -529,9 +431,6 @@ object NativeJournalImpl {
         else abortRemote(pending, null)
       }
       remoteRequests.clear()
-      val previous = java.util.Map.copyOf(restored)
-      savedMigrations = java.util.Map.copyOf(storageMigrations)
-      storageMigrations.clear()
       val freezeIt = freezingNow.iterator()
       while (freezeIt.hasNext) freezing.add(freezeIt.next().route.reservation.player())
       savedRemote = java.util.List.copyOf(freezingNow)
@@ -541,19 +440,13 @@ object NativeJournalImpl {
       // Keep departing players registered until commit so heartbeat renewal cannot release ownership early.
       departing.removeAll(savedDepartures)
       nextSaveNanos = System.nanoTime() + saveIntervalNanos
-      reportCapture(captureStarted, capturedWorlds, tags.size())
+      reportCapture(captureStarted, tags.size())
       saveProgress.begin()
-      fullCapture = false
       try {
         saving = savePipeline.submit[java.util.Map[String, Array[Byte]]](() => {
-          val worldIt = capturedWorlds.iterator()
-          while (worldIt.hasNext) {
-            val world = worldIt.next()
-            chunkSnapshots.capture(world.world, world.key, db.worldBlobs(), previous, snapshots, savePipeline, saveProgress, world.carried)
-          }
           val compression: java.util.List[Callable[java.util.Map.Entry[String, Array[Byte]]]] = new ArrayList()
           tags.forEach((key, tag) => { compression.add(() => java.util.Map.entry(key, NativePlayerCodec.compress(tag))); () })
-          saveProgress.phase("player-and-world-data", compression.size())
+          saveProgress.phase("player-data", compression.size())
           val values = savePipeline.parallel[java.util.Map.Entry[String, Array[Byte]]](compression, () => saveProgress.advance()).iterator()
           while (values.hasNext) { val value = values.next(); snapshots.put(value.getKey, value.getValue) }
           frames.commit(owners, snapshots, () => ())
@@ -563,15 +456,12 @@ object NativeJournalImpl {
     }
 
     /** Server-thread capture time is the one remaining periodic cost of a checkpoint; make it visible. */
-    private[NativeJournalImpl] def reportCapture(started: Long, worlds: java.util.List[CapturedWorld], tags: Int): Unit = {
+    private[NativeJournalImpl] def reportCapture(started: Long, tags: Int): Unit = {
       val now = System.nanoTime(); val millis = TimeUnit.NANOSECONDS.toMillis(now - started)
       if (millis < java.lang.Long.getLong("link.captureWarnMillis", 50L).longValue()) return
       if (now - lastCaptureReport < TimeUnit.SECONDS.toNanos(60) && lastCaptureReport != 0) return
       lastCaptureReport = now
-      var chunks = 0; var carried = 0
-      val it = worlds.iterator()
-      while (it.hasNext) { val world = it.next(); chunks += world.world.getChunkStorage().size(); carried += world.carried.size() }
-      MinecraftServer.LOGGER.warn("Link checkpoint capture held the server thread for {} ms ({} worlds, {} chunks copied, {} unchanged chunks carried, {} player/data tags)", millis, worlds.size(), chunks, carried, tags)
+      MinecraftServer.LOGGER.warn("Link checkpoint capture held the server thread for {} ms ({} players)", millis, tags)
     }
 
     /** Completion runs on the server thread; workers never invoke Bukkit/plugin callbacks. */
@@ -606,7 +496,7 @@ object NativeJournalImpl {
         }
       if (wait || storageDegraded) MinecraftServer.LOGGER.info("Link save completed: {}", saveProgress.status())
       storageDegraded = false; retryNotBefore = 0
-      restored.putAll(result); saving = null; savedMigrations = java.util.Map.of()
+      saving = null
       val completed = savedCompletions; savedCompletions = java.util.List.of(); savedFailures = java.util.List.of()
       val completedIt = completed.iterator()
       while (completedIt.hasNext) {
@@ -646,15 +536,12 @@ object NativeJournalImpl {
 
     /** The checkpoint did not commit. Everything that waited for it is re-queued for the next attempt. */
     private[NativeJournalImpl] def storageFailed(cause: Throwable): Unit = {
-      // Change tracking advanced for a capture that never committed: forget it so the next capture is complete.
-      fullCapture = true; chunkSnapshots.invalidate()
       val first = !storageDegraded; storageDegraded = true; retryNotBefore = System.nanoTime() + RETRY_NANOS
       if (first || saveProgress.reportDue()) MinecraftServer.LOGGER.error("Link checkpoint failed; gameplay continues and the save is retried every 5s. Cross-server travel waits for a successful save.", cause)
       val c: java.util.List[Runnable] = new ArrayList(savedCompletions); c.addAll(completions); completions.clear(); completions.addAll(c)
       val f: java.util.List[java.util.function.Consumer[Throwable]] = new ArrayList(savedFailures); f.addAll(failures); failures.clear(); failures.addAll(f)
       savedCompletions = java.util.List.of(); savedFailures = java.util.List.of()
       departing.addAll(savedDepartures); savedDepartures = java.util.Set.of()
-      savedMigrations.forEach((key, value) => { storageMigrations.putIfAbsent(key, value); () }); savedMigrations = java.util.Map.of()
       val it = savedRemote.iterator()
       while (it.hasNext) abortRemote(it.next(), "저장에 실패해 서버 이동을 취소했습니다. 잠시 후 다시 시도하세요.")
       savedRemote = java.util.List.of()
@@ -669,7 +556,7 @@ object NativeJournalImpl {
         try task.run()
         catch {
           case fatal: FatalJournalException => throw fatal
-          case error: RuntimeException => MinecraftServer.LOGGER.error("Link deferred world task failed", error)
+          case error: RuntimeException => MinecraftServer.LOGGER.error("Link deferred task failed", error)
         }
       }
     }
@@ -758,33 +645,6 @@ object NativeJournalImpl {
       }))
     }
 
-    private[NativeJournalImpl] def storageKey(path: java.nio.file.Path): String = this.synchronized {
-      val normalized = path.toAbsolutePath().normalize()
-      val worlds = java.nio.file.Path.of("link-saved-worlds").toAbsolutePath().normalize()
-      val legacy = "native:" + node + "/saved/" + UUID.nameUUIDFromBytes(normalized.toString().getBytes(StandardCharsets.UTF_8))
-      var key: String = null
-      if (normalized.startsWith(worlds)) key = "native:" + node + "/saved/world/" + worlds.relativize(normalized).toString().replace('\\', '/')
-      else {
-        if (globalStoragePath == null) globalStoragePath = normalized
-        key = if (normalized.equals(globalStoragePath)) "native:" + node + "/saved/global" else legacy
-      }
-      // Preserve early development snapshots while moving to location-independent
-      // global/world keys. Copies are journaled atomically in the next frame.
-      if (!key.equals(legacy)) {
-        val copies: java.util.Map[String, Array[Byte]] = new HashMap()
-        val it = restored.entrySet().iterator()
-        while (it.hasNext) {
-          val entry = it.next()
-          if (entry.getKey.startsWith(legacy + "/")) {
-            val target = key + entry.getKey.substring(legacy.length())
-            if (!restored.containsKey(target)) copies.put(target, entry.getValue)
-          }
-        }
-        restored.putAll(copies); storageMigrations.putAll(copies)
-      }
-      key
-    }
-
     private[NativeJournalImpl] def worldKey(name: String): String = "native:" + node + "/world/" + name
 
     private[NativeJournalImpl] def claimArrival(player: UUID, connection: Connection): Unit = {
@@ -848,9 +708,6 @@ object NativeJournalImpl {
       }
       val local = route.reservation.destination().node().equals(node)
       try {
-        if (player.getBukkitEntity().getPersistentDataContainer().has(LinkEditors.KEY, org.bukkit.persistence.PersistentDataType.STRING)) {
-          offThread("route rejection", () => routes.reject(route), null); player.getBukkitEntity().sendMessage("템플릿 편집을 종료한 뒤 이동하세요."); return
-        }
         val d = route.reservation.destination(); val world: org.bukkit.World = if (local) Bukkit.getWorld(d.world()) else null
         if (local && world == null) { offThread("route rejection", () => routes.reject(route), null); player.getBukkitEntity().sendMessage("이동할 월드가 로드되지 않았습니다."); return }
         player.closeContainer(); player.stopRiding()
@@ -863,7 +720,7 @@ object NativeJournalImpl {
           completions.add(() => offThread("local route acknowledgement", () => {
             try {
               val arrived: Destination = routes.completeLocal(route, owner)
-              admitted.computeIfPresent(id, (key, current) => new ArrivalStore.Arrival(current.ticket, current.session, arrived))
+              admitted.computeIfPresent(id, (key, current) => current.copy(destination = arrived))
               ()
             } finally { localTravel.remove(id) }
           }, null))

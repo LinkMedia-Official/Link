@@ -105,9 +105,8 @@ tasks.register<Copy>("linkDist") {
         exclude("*-plain.jar")
         rename { "Link-Velocity-dev.jar" }
     }
-    from(project(":link-api").layout.buildDirectory.dir("libs")) {
-        include("link-api-*.jar")
-        exclude("*-sources.jar", "*-javadoc.jar")
+    // The jar task output, not a glob: stale jars from older API versions must not collide.
+    from(project(":link-api").tasks.named("jar")) {
         rename { "Link-API-dev.jar" }
     }
 }

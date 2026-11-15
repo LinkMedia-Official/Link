@@ -22,7 +22,6 @@ private[server] final class LinkTeleportCommand private[server] (name: String, s
       case _ => sender.sendMessage("플레이어만 사용할 수 있습니다."); return true
     }
     if (!journal) { sender.sendMessage("티피 요청은 journal 모드에서 사용할 수 있습니다."); return true }
-    if (player.getPersistentDataContainer().has(LinkEditors.KEY, PersistentDataType.STRING)) { sender.sendMessage("/템플릿 나가기 후 티피 요청을 사용하세요."); return true }
     val request = getName().equals("tpa") || getName().equals("tpahere")
     if ((request && args.length != 1) || (!request && args.length > 1) || (getName().equals("tpacancel") && args.length != 0)) { sender.sendMessage(getUsage()); return true }
     val operation: CompletionStage[?] = getName() match {

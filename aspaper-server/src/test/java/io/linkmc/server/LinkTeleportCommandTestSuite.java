@@ -41,10 +41,10 @@ class LinkTeleportCommandTestSuite {
         when(service.respond(id,null,true)).thenReturn(CompletableFuture.failedFuture(new TeleportStore.Rejected("요청이 없습니다")));
         command("tpaccept").execute(player,"티피수락",new String[0]);verify(player).sendMessage("요청이 없습니다");
     }
-    @Test void invalidArgumentsConsoleAndEditorDoNotTouchSql(){
+    @Test void invalidArgumentsAndConsoleDoNotTouchSql(){
         command("tpa").execute(player,"tpa",new String[0]);command("tpaccept").execute(player,"tpaccept",new String[]{"Bob","extra"});command("tpacancel").execute(player,"tpacancel",new String[]{"extra"});
         CommandSender console=mock(CommandSender.class);when(console.hasPermission("link.tpa")).thenReturn(true);command("tpa").execute(console,"tpa",new String[]{"Bob"});
-        when(player.getPersistentDataContainer().has(LinkEditors.KEY,PersistentDataType.STRING)).thenReturn(true);command("tpa").execute(player,"tpa",new String[]{"Bob"});verifyNoInteractions(service);
+        verifyNoInteractions(service);
     }
     @Test void permissionDenialAndToolsModeDoNotTouchSql(){
         when(player.hasPermission("link.tpa")).thenReturn(false);

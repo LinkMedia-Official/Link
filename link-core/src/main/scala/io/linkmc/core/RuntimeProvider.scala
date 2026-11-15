@@ -10,7 +10,8 @@ final class RuntimeProvider extends LinkApi {
   override def data(): LinkApi.Data = RuntimeProvider.runtime().data()
   override def sessions(): LinkApi.Sessions = RuntimeProvider.runtime().sessions()
   override def network(): LinkApi.Network = RuntimeProvider.runtime().network()
-  override def worlds(): LinkApi.Worlds = RuntimeProvider.runtime().worlds()
+  override def teleports(): LinkApi.Teleports = RuntimeProvider.runtime().teleports()
+  override def utilities(): LinkApi.Utilities = RuntimeProvider.runtime().utilities()
   override def engine(): LinkApi.Engine = RuntimeProvider.runtime().engine()
 }
 

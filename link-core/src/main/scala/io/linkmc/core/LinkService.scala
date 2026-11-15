@@ -1,7 +1,7 @@
 package io.linkmc.core
 
 import io.linkmc.api.LinkApi
-import io.linkmc.api.LinkApi.{Change, Channel, Commit, Destination, Event, Reservation, Session, State, TeleportRequest, Transaction, Transfer, WarpGroup}
+import io.linkmc.api.LinkApi.{Change, Channel, Commit, Destination, Event, Reservation, Session, State, TeleportRequest, Transaction, Transfer}
 
 import java.util.{List, Objects, Optional, UUID}
 import java.util.concurrent.{ArrayBlockingQueue, CompletableFuture, CompletionException, CompletionStage, ExecutorService, RejectedExecutionException, ThreadPoolExecutor, TimeUnit}
@@ -11,7 +11,7 @@ final class LinkService(database: Database, routeSubmitted: java.util.function.C
   Objects.requireNonNull(routeSubmitted)
   private val events = new EventStore(database); private val sessionStore = new SessionStore(database, 30); private val networkStore = new NetworkStore(database)
   private val routes = new RouteStore(database)
-  private val teleportStore = new TeleportStore(database); private val groups = new WarpGroupStore(database)
+  private val teleportStore = new TeleportStore(database)
   // FIFO submission order within one runtime. Across runtimes, versions and
   // fencing reject stale work; callers must explicitly reconcile conflicts.
   private val executor: ExecutorService = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue[Runnable](1024),
@@ -31,7 +31,7 @@ final class LinkService(database: Database, routeSubmitted: java.util.function.C
     override def read(id: String): CompletionStage[Optional[State]] = async[Optional[State]](() => events.read(id))
     override def commit(tx: Transaction): CompletionStage[Commit] = async[Commit](() => {
       if (tx.changes().stream().anyMatch((c: Change) => c.id().startsWith("native:") || c.id().startsWith("player:") || c.id().startsWith("warp:") || c.id().startsWith("tpa:") || c.id().startsWith("group-request:") || c.id().startsWith("group-world:")))
-        throw new IllegalArgumentException("Reserved state: use engine().transact for native state or the network warp API")
+        throw new IllegalArgumentException("Reserved state: use engine().transact for native state")
       events.commit(tx)
     })
     override def history(id: String, after: Long, limit: Int): CompletionStage[List[Event]] = async[List[Event]](() => events.history(id, after, limit))
@@ -70,33 +70,13 @@ final class LinkService(database: Database, routeSubmitted: java.util.function.C
       null
     }
   })
-  override def warpGroups(): LinkApi.WarpGroups = new LinkApi.WarpGroups {
-    override def bind(name: String, template: String, version: Int, node: String): CompletionStage[Void] = async[Void](() => { groups.bind(name, template, version, node); null })
-    override def list(): CompletionStage[List[WarpGroup]] = async[List[WarpGroup]](() => groups.list())
-    override def channels(name: String): CompletionStage[List[Channel]] = async[List[Channel]](() => groups.channels(name))
-    override def status(id: UUID): CompletionStage[String] = async[String](() => { val routed = routes.status(id); if (routed.equals("MISSING")) groups.status(id) else routed })
-    override def travel(player: UUID, operation: UUID, name: String): CompletionStage[Void] =
-      async[java.lang.Boolean](() => if (groups.exists(name)) { groups.enqueue(player, operation, name); java.lang.Boolean.TRUE } else java.lang.Boolean.FALSE).thenCompose[Void]((group: java.lang.Boolean) => {
-        if (group.booleanValue()) CompletableFuture.completedFuture[Void](null)
-        else LinkService.this.network().warp(name).thenCompose[Void]((target: Optional[Destination]) => {
-          if (target.isEmpty()) CompletableFuture.failedFuture[Void](new ConflictException("Unknown warp"))
-          else LinkService.this.network().requestTravel(player, operation, target.get()).thenApply[Void]((r: Reservation) => null)
-        })
-      })
-  }
   override def network(): LinkApi.Network = new LinkApi.Network {
     override def channels(): CompletionStage[List[Channel]] = async[List[Channel]](() => networkStore.channels())
-    override def registerChannel(id: String, spawn: Destination, capacity: Int): CompletionStage[Void] = async[Void](() => { networkStore.register(id, spawn, capacity); null })
-    override def setChannelReady(id: String, ready: Boolean): CompletionStage[Void] = async[Void](() => { networkStore.ready(id, ready); null })
     override def reserve(player: UUID, request: UUID): CompletionStage[Reservation] = async[Reservation](() => networkStore.reserve(player, request))
     override def reserve(player: UUID, request: UUID, destination: Destination): CompletionStage[Reservation] = async[Reservation](() => networkStore.reserve(player, request, destination))
     override def cancel(r: UUID, p: UUID): CompletionStage[Void] = async[Void](() => { networkStore.cancel(r, p); null })
-    override def warp(name: String): CompletionStage[Optional[Destination]] = async[Optional[Destination]](() => networkStore.warp(name))
-    override def setWarp(name: String, d: Destination): CompletionStage[Void] = async[Void](() => { networkStore.setWarp(name, d); null })
-    override def setWarp(name: String, d: Destination, capacity: Int): CompletionStage[Void] = async[Void](() => { networkStore.setWarp(name, d, capacity); null })
-    override def deleteWarp(name: String): CompletionStage[java.lang.Boolean] = async[java.lang.Boolean](() => Boolean.box(networkStore.deleteWarp(name)))
-    override def warps(): CompletionStage[List[String]] = async[List[String]](() => networkStore.warps())
     override def requestTravel(player: UUID, operation: UUID, destination: Destination): CompletionStage[Reservation] = async[Reservation](() => {
+      Objects.requireNonNull(destination, "Travel needs an explicit destination")
       val reservation = routes.requestTravel(player, operation, destination)
       // This is a wake-up hint after durable submission. Polling remains the recovery path.
       try routeSubmitted.accept(new RouteStore.Request(operation, reservation))

@@ -10,7 +10,3 @@ dependencies {
     compileOnly("com.mojang:datafixerupper:10.0.21")
     compileOnly("io.netty:netty-transport:4.2.16.Final")
 }
-tasks.register<JavaExec>("seedTemplate") {
-    classpath = sourceSets.main.get().runtimeClasspath
-    mainClass.set("io.linkmc.integration.SeedTemplate")
-}

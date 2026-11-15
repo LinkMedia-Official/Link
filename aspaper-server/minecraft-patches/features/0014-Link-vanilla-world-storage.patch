@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Link <link@localhost>
+Date: Sun, 15 Nov 2026 07:53:14 +0900
+Subject: [PATCH] Link vanilla world storage
+
+
+diff --git a/net/minecraft/server/Main.java b/net/minecraft/server/Main.java
+index c01cf7a8613ef91f532b1b83ce95e0b1d5f657a1..4d4f3067a7536d63aace94cf9b359dc788bc4ce6 100644
+--- a/net/minecraft/server/Main.java
++++ b/net/minecraft/server/Main.java
+@@ -198,7 +198,7 @@ public class Main {
+             LevelStorageSource levelStorageSource = LevelStorageSource.createDefault(universePath.toPath());
+             LevelStorageSource.LevelStorageAccess access = levelStorageSource.validateAndCreateAccess(levelName);
+             Dynamic<?> levelDataTag;
+-            if (access.hasWorldData() && !io.linkmc.server.LinkConfiguration.get().mode().equals("journal")) {
++            if (access.hasWorldData()) {
+                 Dynamic<?> levelDataUnfixed;
+                 try {
+                     levelDataUnfixed = access.getUnfixedDataTagWithFallback();
+diff --git a/net/minecraft/server/commands/SaveAllCommand.java b/net/minecraft/server/commands/SaveAllCommand.java
+index 99ccc3971eb39a40074957d7833b7ce11fd7e602..7e27b3d4c589aab475ed90671d39406573574b71 100644
+--- a/net/minecraft/server/commands/SaveAllCommand.java
++++ b/net/minecraft/server/commands/SaveAllCommand.java
+@@ -23,6 +23,12 @@ public class SaveAllCommand {
+ 
+     private static int saveAll(final CommandSourceStack source, final boolean flush) throws CommandSyntaxException {
+         source.sendSuccess(() -> Component.translatable("commands.save.saving"), false);
++        MinecraftServer server = source.getServer();
++        boolean success = server.saveEverything(true, flush, true);
++        if (!success) {
++            throw ERROR_FAILED.create();
++        }
++        // Link: worlds are vanilla files (saved above); player data is committed by the ordered Link checkpoint.
+         if (io.linkmc.server.NativeJournal.enabled()) {
+             io.linkmc.server.NativeJournal.saveAsync().whenComplete((ignored, error) -> {
+                 if (error == null) source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
+@@ -30,11 +36,6 @@ public class SaveAllCommand {
+             });
+             return Command.SINGLE_SUCCESS;
+         }
+-        MinecraftServer server = source.getServer();
+-        boolean success = server.saveEverything(true, flush, true);
+-        if (!success) {
+-            throw ERROR_FAILED.create();
+-        }
+ 
+         source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
+         return Command.SINGLE_SUCCESS;
+diff --git a/net/minecraft/server/network/config/PrepareSpawnTask.java b/net/minecraft/server/network/config/PrepareSpawnTask.java
+index 9dcc19dc9a271cf640cdab384e86dd609dd46a53..08d59577656d56eb4b17dd37bd16df6f80fe724f 100644
+--- a/net/minecraft/server/network/config/PrepareSpawnTask.java
++++ b/net/minecraft/server/network/config/PrepareSpawnTask.java
+@@ -126,8 +126,9 @@ public class PrepareSpawnTask implements ConfigurationTask {
+                 .orElseGet(() -> PlayerSpawnFinder.findSpawn(finalSpawnLevel, respawnData.pos()));
+             // Paper end - move logic in Entity to here, to use bukkit supplied world UUID & reset to main world spawn if no valid world is found
+             Vec2 spawnAngle = loadedPosition.rotation().orElse(new Vec2(respawnData.yaw(), respawnData.pitch()));
+-            if (io.linkmc.server.NativeJournal.enabled()) {
+-                var destination = io.linkmc.server.NativeJournal.destination(this.nameAndId.id());
++            // Link: only an explicit cross-server destination overrides vanilla placement (saved position / world spawn).
++            var destination = io.linkmc.server.NativeJournal.enabled() ? io.linkmc.server.NativeJournal.destination(this.nameAndId.id()) : null;
++            if (destination != null) {
+                 var target = org.bukkit.Bukkit.getWorld(destination.world());
+                 if (target == null) throw new IllegalStateException("Reserved Link world is not ready");
+                 spawnLevel = ((org.bukkit.craftbukkit.CraftWorld) target).getHandle();
+@@ -264,8 +265,8 @@ public class PrepareSpawnTask implements ConfigurationTask {
+                     this.spawnAngle = new Vec2(location.getYaw(), location.getPitch());
+                 }
+                 // Paper end - PlayerSpawnLocationEvent
+-                if (io.linkmc.server.NativeJournal.enabled()) {
+-                    var destination = io.linkmc.server.NativeJournal.destination(PrepareSpawnTask.this.nameAndId.id());
++                var destination = io.linkmc.server.NativeJournal.enabled() ? io.linkmc.server.NativeJournal.destination(PrepareSpawnTask.this.nameAndId.id()) : null;
++                if (destination != null) {
+                     this.spawnLevel = ((org.bukkit.craftbukkit.CraftWorld) java.util.Objects.requireNonNull(org.bukkit.Bukkit.getWorld(destination.world()), "Reserved world unavailable")).getHandle();
+                     spawnPosition = new Vec3(destination.x(), destination.y(), destination.z());
+                     this.spawnPosition = CompletableFuture.completedFuture(spawnPosition);
+diff --git a/net/minecraft/world/level/storage/LevelStorageSource.java b/net/minecraft/world/level/storage/LevelStorageSource.java
+index 518ec1428af670de7f4025fac22ccdf24e63234a..01b4ea4159d1885c4f409cca85297342bf485d56 100644
+--- a/net/minecraft/world/level/storage/LevelStorageSource.java
++++ b/net/minecraft/world/level/storage/LevelStorageSource.java
+@@ -583,7 +583,6 @@ public class LevelStorageSource {
+         }
+ 
+         public void saveDataTag(final WorldData levelData, final @Nullable UUID singleplayerUUID) {
+-            if (io.linkmc.server.NativeJournal.enabled()) return;
+             CompoundTag dataTag = levelData.createTag(singleplayerUUID);
+             CompoundTag root = new CompoundTag();
+             root.put("Data", dataTag);
+diff --git a/net/minecraft/world/level/storage/SavedDataStorage.java b/net/minecraft/world/level/storage/SavedDataStorage.java
+index 88e28629933299217b9bb86c30e122512677278f..dfc72b4c9597a30d9991549ef111ba69cf5ea37b 100644
+--- a/net/minecraft/world/level/storage/SavedDataStorage.java
++++ b/net/minecraft/world/level/storage/SavedDataStorage.java
+@@ -51,7 +51,6 @@ public class SavedDataStorage implements AutoCloseable {
+         this.fixerUpper = fixerUpper;
+         this.dataFolder = dataFolder;
+         this.registries = registries;
+-        io.linkmc.server.NativeJournal.registerStorage(this, dataFolder);
+     }
+ 
+     private Path getDataFile(final Identifier id) {
+@@ -85,10 +84,6 @@ public class SavedDataStorage implements AutoCloseable {
+     }
+ 
+     private <T extends SavedData> @Nullable T readSavedData(final SavedDataType<T> type) {
+-        if (io.linkmc.server.NativeJournal.enabled()) {
+-            return io.linkmc.server.NativeJournal.savedData(this, this.dataFolder, type.id().toString())
+-                .map(tag -> type.codec().parse(this.registries.createSerializationContext(NbtOps.INSTANCE), tag.get("data")).getOrThrow()).orElse(null);
+-        }
+         try {
+             Path file = this.getDataFile(type.id());
+             if (Files.exists(file)) {
+@@ -156,7 +151,6 @@ public class SavedDataStorage implements AutoCloseable {
+     }
+ 
+     public CompletableFuture<?> scheduleSave() {
+-        if (io.linkmc.server.NativeJournal.enabled()) return CompletableFuture.completedFuture(null);
+         if (this.closed) {
+             throw new IllegalStateException("Trying to schedule save when SavedDataStorage is already closed");
+         }

@@ -31,8 +31,5 @@ public final class NativeJournal {
     public static void left(ServerPlayer player) { BRIDGE.left(player); }
     public static com.google.gson.JsonElement stats(UUID id) { return BRIDGE.stats(id); }
     public static com.google.gson.JsonElement advancements(UUID id) { return BRIDGE.advancements(id); }
-    public static Optional<CompoundTag> savedData(net.minecraft.world.level.storage.SavedDataStorage storage, java.nio.file.Path path, String id) { return BRIDGE.savedData(storage, path, id); }
-    public static void seedStorage(String world, CompoundTag seed) { BRIDGE.seedStorage(world, seed); }
-    public static void registerStorage(net.minecraft.world.level.storage.SavedDataStorage storage, java.nio.file.Path path) { BRIDGE.registerStorage(storage, path); }
     public static CompletableFuture<Void> saveAsync() { return BRIDGE.saveAsync(); }
 }

@@ -9,8 +9,9 @@ import org.bukkit.configuration.file.YamlConfiguration;
 /** One startup snapshot; secrets are never copied into JVM properties or logged. */
 public final class LinkConfiguration {
     private static LinkConfiguration instance;
-    private final String mode, node, jdbcUrl, username, password, redisUri, template;
-    private final int templateVersion, worldCapacity, nodeCapacity, maxWorlds;
+    private final String mode, node, jdbcUrl, username, password, redisUri;
+    private final int worldCapacity, nodeCapacity;
+    private final java.util.List<String> autoloadWorlds;
     private final String storage,endpoint,region,bucket,prefix,accessKey,secretKey;
     private final boolean retentionEnabled;
     private final int retentionHours,retentionInterval,retentionBatch,retentionBatches;
@@ -48,11 +49,15 @@ public final class LinkConfiguration {
         Object enabled=yaml.get("redis.enabled",false);
         if(!(enabled instanceof Boolean))throw new IllegalArgumentException("redis.enabled must be true or false in link.yml");
         redisUri=env.getOrDefault("LINK_REDIS_URI",Boolean.TRUE.equals(enabled)?string(yaml,"redis.uri","redis://127.0.0.1:6379"):"");
-        template=props.getProperty("link.spawn.template",string(yaml,"spawn.template","lobby"));
-        templateVersion=positive(yaml,props,"spawn.version","link.spawn.version",1);
-        worldCapacity=positive(yaml,props,"spawn.capacity","link.spawn.capacity",50);
+        // Capacity of a destination world reached by /tp travel (the old spawn.capacity key is still honored).
+        worldCapacity=positive(yaml,props,yaml.contains("worlds.capacity")?"worlds.capacity":"spawn.capacity","link.worlds.capacity",50);
         nodeCapacity=positive(yaml,props,"node.capacity","link.node.capacity",150);
-        maxWorlds=positive(yaml,props,"spawn.max-worlds","link.spawn.max-worlds",3);
+        var autoload=new java.util.ArrayList<String>();
+        for(Object value:yaml.getList("worlds.autoload",java.util.List.of())){
+            if(!(value instanceof String name)||name.isBlank())throw new IllegalArgumentException("worlds.autoload must be a list of world names");
+            autoload.add(name);
+        }
+        autoloadWorlds=java.util.List.copyOf(autoload);
         storage=string(yaml,"storage.worlds","database");
         if(!java.util.Set.of("database","slimevault").contains(storage))throw new IllegalArgumentException("storage.worlds must be database or slimevault");
         endpoint=string(yaml,"storage.slimevault.endpoint","http://127.0.0.1:3900");
@@ -73,7 +78,7 @@ public final class LinkConfiguration {
         saveStallSeconds=bounded(yaml,"saving.stall-timeout-seconds",120,10,3600);
         saveTimeoutSeconds=bounded(yaml,"saving.total-timeout-seconds",1800,30,86400);
         if(saveTimeoutSeconds<saveStallSeconds)throw new IllegalArgumentException("saving.total-timeout-seconds must be >= stall timeout");
-        io.linkmc.api.LinkApi.requireName(node);io.linkmc.api.LinkApi.requireName(template);
+        io.linkmc.api.LinkApi.requireName(node);
         if(mode.equals("journal")||mode.equals("tools")){
             if((!jdbcUrl.startsWith("jdbc:postgresql:")&&!jdbcUrl.startsWith("jdbc:mariadb:"))||username.isBlank()||password.isBlank())
                 throw new IllegalArgumentException("Configure database.jdbc-url, username and password in link.yml (or LINK_JDBC_URL, LINK_DB_USER, LINK_DB_PASSWORD)");
@@ -108,11 +113,24 @@ public final class LinkConfiguration {
     public String username(){return username;}
     public String password(){return password;}
     public String redisUri(){return redisUri;}
-    public String template(){return template;}
-    public int templateVersion(){return templateVersion;}
     public int worldCapacity(){return worldCapacity;}
     public int nodeCapacity(){return nodeCapacity;}
-    public int maxWorlds(){return maxWorlds;}
+    public java.util.List<String> autoloadWorlds(){return autoloadWorlds;}
+    /** Appends worlds to worlds.autoload in link.yml (used once by the vanilla export). */
+    static synchronized void addAutoload(java.util.Collection<String> names){
+        Path file=Path.of("link.yml");
+        try{
+            var yaml=new YamlConfiguration();yaml.load(file.toFile());
+            var merged=new java.util.LinkedHashSet<String>();
+            for(Object value:yaml.getList("worlds.autoload",java.util.List.of()))merged.add(String.valueOf(value));
+            merged.addAll(names);
+            yaml.set("worlds.autoload",new java.util.ArrayList<>(merged));
+            yaml.setComments("worlds",java.util.List.of("Worlds are vanilla folders; these are opened at startup (void generator)."));
+            yaml.save(file.toFile());
+        }catch(IOException|org.bukkit.configuration.InvalidConfigurationException e){
+            throw new IllegalStateException("Cannot update worlds.autoload in link.yml");
+        }
+    }
     public io.linkmc.core.WorldBlobs.Store worldStorage(){
         return storage.equals("database")?null:new io.linkmc.core.SlimeVaultStore(endpoint,region,bucket,prefix,accessKey,secretKey);
     }
@@ -149,6 +167,7 @@ public final class LinkConfiguration {
           jdbc-url: 'jdbc:postgresql://127.0.0.1:5432/link'
           username: 'link'
           password: ''
+        # Only read once, to export worlds an older Link build kept in the database or SlimeVault.
         storage:
           worlds: database
           slimevault:
@@ -161,10 +180,9 @@ public final class LinkConfiguration {
         redis:
           enabled: false
           uri: 'redis://127.0.0.1:6379'
-        spawn:
-          template: lobby
-          version: 1
+        # Worlds are vanilla folders. Listed worlds are opened at startup; capacity limits /tp arrivals per world.
+        worlds:
+          autoload: []
           capacity: 50
-          max-worlds: 3
         """+RETENTION_DEFAULTS+SAVING_DEFAULTS;
 }

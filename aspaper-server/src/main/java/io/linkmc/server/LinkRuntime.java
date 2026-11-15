@@ -12,5 +12,4 @@ public final class LinkRuntime {
     public static void afterWorlds() { BRIDGE.afterWorlds(); }
     public static void beginShutdown() { BRIDGE.beginShutdown(); }
     public static void stop() { BRIDGE.stop(); }
-    public static boolean managesWorlds() { return BRIDGE.managesWorlds(); }
 }

@@ -30,12 +30,12 @@ class LinkConfigurationTestSuite {
         assertEquals("custom",load().node());assertTrue(Files.readString(file()).startsWith("# keep my comment"));
     }
     @Test void journalReadsYamlWithoutEnvironmentVariables()throws Exception{
-        Files.writeString(file(),"mode: journal\nnode:\n  id: node-b\n  capacity: 75\ndatabase:\n  jdbc-url: 'jdbc:postgresql://localhost/link'\n  username: 'tester'\n  password: 'spaces # : secret'\nredis:\n  enabled: true\n  uri: 'redis://localhost:6379'\nspawn:\n  template: hub\n  version: 2\n  capacity: 25\n  max-worlds: 4\n");
+        Files.writeString(file(),"mode: journal\nnode:\n  id: node-b\n  capacity: 75\ndatabase:\n  jdbc-url: 'jdbc:postgresql://localhost/link'\n  username: 'tester'\n  password: 'spaces # : secret'\nredis:\n  enabled: true\n  uri: 'redis://localhost:6379'\nworlds:\n  autoload: ['island_a', 'edit-1']\n  capacity: 25\n");
         var config=load();assertEquals("journal",config.mode());assertEquals("node-b",config.node());assertEquals("tester",config.username());assertEquals("spaces # : secret",config.password());
-        assertEquals("redis://localhost:6379",config.redisUri());assertEquals("hub",config.template());assertEquals(2,config.templateVersion());assertEquals(25,config.worldCapacity());assertEquals(75,config.nodeCapacity());assertEquals(4,config.maxWorlds());
+        assertEquals("redis://localhost:6379",config.redisUri());assertEquals(java.util.List.of("island_a","edit-1"),config.autoloadWorlds());assertEquals(25,config.worldCapacity());assertEquals(75,config.nodeCapacity());
     }
     @Test void legacyOverridesWinWithoutWritingSecretsToFile()throws Exception{
-        var properties=new Properties();properties.setProperty("link.mode","journal");properties.setProperty("link.spawn.capacity","12");
+        var properties=new Properties();properties.setProperty("link.mode","journal");properties.setProperty("link.worlds.capacity","12");
         var config=LinkConfiguration.load(file(),Map.of("LINK_DB_PASSWORD","env-secret","LINK_NODE_ID","env-node","LINK_REDIS_URI","redis://localhost:6380"),properties);
         assertEquals("env-secret",config.password());assertEquals("env-node",config.node());assertEquals(12,config.worldCapacity());assertEquals("redis://localhost:6380",config.redisUri());
         assertFalse(Files.readString(file()).contains("env-secret"));assertFalse(properties.containsKey("LINK_DB_PASSWORD"));

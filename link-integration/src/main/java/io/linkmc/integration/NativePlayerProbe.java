@@ -19,7 +19,7 @@ final class NativePlayerProbe {
     static void disconnect(){if(active!=null){NativeJournal.left(active);active.connection.connection.channel.close();active=null;}}
     static void run(String mode){
         if(mode.equals("player-transfer")){
-            io.linkmc.api.Link.api().network().requestTravel(ID,UUID.randomUUID(),new io.linkmc.api.LinkApi.Destination("test-b","link-spawn",8,66,8,90,0)).whenComplete((r,e)->{
+            io.linkmc.api.Link.api().network().requestTravel(ID,UUID.randomUUID(),new io.linkmc.api.LinkApi.Destination("test-b",org.bukkit.Bukkit.getWorlds().getFirst().getName(),8,66,8,90,0)).whenComplete((r,e)->{
                 if(e!=null)org.bukkit.Bukkit.getLogger().log(java.util.logging.Level.SEVERE,"LINK_TRANSFER_FAILED",e);
                 else org.bukkit.Bukkit.getLogger().info("LINK_TRANSFER_REQUESTED "+r.id());
             });return;
@@ -28,7 +28,7 @@ final class NativePlayerProbe {
         try{
             Database db=new Database(()->java.sql.DriverManager.getConnection(System.getenv("LINK_JDBC_URL"),System.getenv("LINK_DB_USER"),System.getenv("LINK_DB_PASSWORD")));
             if(!arriving){
-                UUID ticket=UUID.randomUUID();var reservation=new NetworkStore(db).reserve(ID,ticket,new io.linkmc.api.LinkApi.Destination(System.getenv("LINK_NODE_ID"),"link-spawn",1,66,1,0,0));
+                UUID ticket=UUID.randomUUID();var reservation=new NetworkStore(db).reserve(ID,ticket,new io.linkmc.api.LinkApi.Destination(System.getenv("LINK_NODE_ID"),org.bukkit.Bukkit.getWorlds().getFirst().getName(),1,66,1,0,0));
                 new ArrivalStore(db).issue(ticket,reservation,null);
             }
             Connection connection=new Connection(PacketFlow.SERVERBOUND);
@@ -38,7 +38,7 @@ final class NativePlayerProbe {
             connection.address=new java.net.InetSocketAddress("127.0.0.1",25599);connection.preparing=false;
             NativeJournal.prepare(ID,connection);
             MinecraftServer server=MinecraftServer.getServer();
-            ServerLevel level=((org.bukkit.craftbukkit.CraftWorld)org.bukkit.Bukkit.getWorld("link-spawn")).getHandle();
+            ServerLevel level=((org.bukkit.craftbukkit.CraftWorld)org.bukkit.Bukkit.getWorlds().getFirst()).getHandle();
             var profile=new com.mojang.authlib.GameProfile(ID,"LinkProbe");
             ServerPlayer player=new ServerPlayer(server,level,profile,ClientInformation.createDefault());
             new ServerGamePacketListenerImpl(server,connection,player,CommonListenerCookie.createInitial(profile,false));
@@ -46,8 +46,8 @@ final class NativePlayerProbe {
                 NativeJournal.playerData(ID).ifPresent(tag->player.load(net.minecraft.world.level.storage.TagValueInput.create(reporter,server.registryAccess(),tag)));
             }
             var destination=NativeJournal.destination(ID);
-            player.snapTo(destination.x(),destination.y(),destination.z(),destination.yaw(),destination.pitch());NativeJournal.joined(player);active=player;
-            var block=org.bukkit.Bukkit.getWorld("link-spawn").getBlockAt(5,65,5);
+            if(destination!=null)player.snapTo(destination.x(),destination.y(),destination.z(),destination.yaw(),destination.pitch());NativeJournal.joined(player);active=player;
+            var block=org.bukkit.Bukkit.getWorlds().getFirst().getBlockAt(5,65,5);
             if(prepare){
                 block.setType(org.bukkit.Material.CHEST);
                 var chest=(net.minecraft.world.level.block.entity.ChestBlockEntity)level.getBlockEntity(new net.minecraft.core.BlockPos(5,65,5));

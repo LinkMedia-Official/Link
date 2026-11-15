@@ -202,76 +202,6 @@ class DatabaseIntegrationTest {
             }finally{finish.countDown();}
         }
     }
-    @Test void provisionedSpawnUsesTemplatePositionAndView()throws Exception{
-        network.heartbeat("node-a",100);
-        Worlds worlds=(Worlds)java.lang.reflect.Proxy.newProxyInstance(Worlds.class.getClassLoader(),new Class[]{Worlds.class},(proxy,method,args)->switch(method.getName()){
-            case "create"->CompletableFuture.completedFuture(new WorldInfo((String)args[0],false,0));
-            case "spawn"->CompletableFuture.completedFuture(new Destination("node-a",(String)args[0],2.25,65,3.75,123,17));
-            default->throw new UnsupportedOperationException(method.getName());
-        });
-        assertTrue(new SpawnProvisioner(worlds,network,"node-a","lobby",1,50,3).ensureSpare().toCompletableFuture().get(10,TimeUnit.SECONDS));
-        var channel=network.spawnChannels().getFirst();
-        var reservation=network.reserve(UUID.randomUUID(),UUID.randomUUID());
-        assertEquals(2.25,reservation.destination().x());assertEquals(123,reservation.destination().yaw());assertEquals(17,reservation.destination().pitch());
-        assertEquals(channel.world(),reservation.destination().world());
-    }
-    @Test void groupPolicyImmutableAndFixedWarpNamesCannotCollide()throws Exception{
-        var templates=new TemplateStore(db);var p=new ChannelPolicy(1,2,true,true);templates.publish("mine",1,new byte[]{1,2},p);
-        assertThrows(ConflictException.class,()->templates.publish("mine",1,new byte[]{1,2},ChannelPolicy.defaults()));
-        var groups=new WarpGroupStore(db);groups.bind("mines","mine",1,"node-a");assertEquals(p,groups.list().getFirst().policy());
-        assertThrows(ConflictException.class,()->network.setWarp("mines",new Destination("node-a","world",0,65,0,0,0)));
-        assertTrue(network.warps().contains("mines"));assertTrue(network.deleteWarp("mines"));assertTrue(groups.list().isEmpty());
-    }
-    @Test void groupCreatesAcrossNodesAndRespectsCapacityAndMaximum()throws Exception{
-        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,2,true,true));
-        network.heartbeat("node-a",10);network.heartbeat("node-b",10);groups.bind("mines","mine",1,"node-a");
-        Session nodeA=sessions.acquire(UUID.randomUUID(),"node-a"),nodeB=sessions.acquire(UUID.randomUUID(),"node-b");
-        Session a=sessions.acquire(UUID.randomUUID(),"node-a"),b=sessions.acquire(UUID.randomUUID(),"node-a"),c=sessions.acquire(UUID.randomUUID(),"node-a");
-        UUID one=UUID.randomUUID(),two=UUID.randomUUID(),three=UUID.randomUUID();groups.enqueue(a.player(),one,"mines");groups.provisionDemand();
-        var first=groups.jobs("node-a").getFirst();groups.ready(first,new Destination("node-a",first.world(),7.25,65,8.75,90,12),nodeA);
-        var route=groups.dispatch(groups.pending("node-a").getFirst()).orElseThrow();assertEquals(7.25,route.reservation().destination().x());assertEquals("DISPATCHED",groups.status(one));
-        assertTrue(network.spawnChannels().isEmpty());assertThrows(ConflictException.class,()->network.reserve(UUID.randomUUID(),UUID.randomUUID()));
-        groups.enqueue(b.player(),two,"mines");groups.provisionDemand();var second=groups.jobs("node-b").getFirst();groups.ready(second,new Destination("node-b",second.world(),7.25,65,8.75,90,12),nodeB);
-        assertEquals("node-b",groups.dispatch(groups.pending("node-a").getFirst()).orElseThrow().reservation().destination().node());
-        groups.enqueue(c.player(),three,"mines");assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isEmpty());groups.provisionDemand();assertTrue(groups.jobs("node-a").isEmpty());assertTrue(groups.jobs("node-b").isEmpty());
-        assertEquals(2,network.channels().size());assertEquals("WAITING",groups.status(three));
-    }
-    @Test void concurrentDemandOnlyCreatesOneJobAndLocalPolicyDoesNotUseOtherNodes()throws Exception{
-        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,3,true,false));
-        network.heartbeat("node-a",20);network.heartbeat("node-b",20);groups.bind("mines","mine",1,"node-a");
-        for(int i=0;i<8;i++){var p=sessions.acquire(UUID.randomUUID(),"node-b");groups.enqueue(p.player(),UUID.randomUUID(),"mines");}
-        try(var pool=Executors.newFixedThreadPool(8)){var jobs=new ArrayList<Future<?>>();for(int i=0;i<8;i++)jobs.add(pool.submit(()->{try{groups.provisionDemand();}catch(Exception e){throw new RuntimeException(e);}}));for(var f:jobs)f.get();}
-        assertEquals(1,groups.jobs("node-a").size());assertTrue(groups.jobs("node-b").isEmpty());
-    }
-    @Test void groupWaitExpiryAndSessionChangesNeverDispatch()throws Exception{
-        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1});groups.bind("mines","mine",1,"node-a");
-        Session p=sessions.acquire(UUID.randomUUID(),"node-a");UUID id=UUID.randomUUID();groups.enqueue(p.player(),id,"mines");
-        groups.enqueue(p.player(),id,"mines");assertEquals(1,groups.pending("node-a").size());
-        assertThrows(ConflictException.class,()->groups.enqueue(p.player(),UUID.randomUUID(),"mines"));
-        sessions.release(p);sessions.acquire(p.player(),"node-a");assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isEmpty());assertEquals("FAILED",groups.status(id));
-        UUID expired=UUID.randomUUID();groups.enqueue(p.player(),expired,"mines");db.transaction(c->{update(c,"UPDATE link_group_requests SET expires_at=clock_timestamp()-interval '1 second' WHERE id=?",expired);return null;});
-        assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isEmpty());assertEquals("FAILED",groups.status(expired));assertEquals("MISSING",new RouteStore(db).status(expired));
-    }
-    @Test void disabledAutoExpansionKeepsSingleChannel()throws Exception{
-        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,3,false,false));network.heartbeat("node-a",10);groups.bind("mines","mine",1,"node-a");
-        var node=sessions.acquire(UUID.randomUUID(),"node-a");var a=sessions.acquire(UUID.randomUUID(),"node-a");groups.enqueue(a.player(),UUID.randomUUID(),"mines");groups.provisionDemand();var job=groups.jobs("node-a").getFirst();groups.ready(job,new Destination("node-a",job.world(),0,65,0,0,0),node);groups.dispatch(groups.pending("node-a").getFirst());
-        var b=sessions.acquire(UUID.randomUUID(),"node-a");groups.enqueue(b.player(),UUID.randomUUID(),"mines");groups.provisionDemand();assertTrue(groups.jobs("node-a").isEmpty());
-    }
-    @Test void groupDispatchAndOutboxFailureRollBackReservationAndRoute()throws Exception{
-        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1},new ChannelPolicy(1,1,true,false));network.heartbeat("node-a",10);groups.bind("mines","mine",1,"node-a");
-        var owner=sessions.acquire(UUID.randomUUID(),"node-a");var player=sessions.acquire(UUID.randomUUID(),"node-a");UUID id=UUID.randomUUID();groups.enqueue(player.player(),id,"mines");groups.provisionDemand();var job=groups.jobs("node-a").getFirst();groups.ready(job,new Destination("node-a",job.world(),1,65,2,0,0),owner);
-        UUID operation=UUID.nameUUIDFromBytes(("group:"+id+":DISPATCHED").getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        db.transaction(c->{update(c,"ALTER TABLE link_outbox ADD CONSTRAINT test_group_reject CHECK (id <> '"+operation+"')");return null;});
-        try{assertThrows(Exception.class,()->groups.dispatch(groups.pending("node-a").getFirst()));assertEquals("WAITING",groups.status(id));assertEquals("MISSING",new RouteStore(db).status(id));assertEquals(0,network.channels().getFirst().reserved());}
-        finally{db.transaction(c->{update(c,"ALTER TABLE link_outbox DROP CONSTRAINT test_group_reject");return null;});}
-        assertTrue(groups.dispatch(groups.pending("node-a").getFirst()).isPresent());assertEquals(1,network.channels().getFirst().reserved());
-    }
-    @Test void groupRequestsRetainIdempotencyAfterPruningAndDeletedNamesStayRetired()throws Exception{
-        var groups=new WarpGroupStore(db);new TemplateStore(db).publish("mine",1,new byte[]{1});groups.bind("mines","mine",1,"node-a");var p=sessions.acquire(UUID.randomUUID(),"node-a");UUID id=UUID.randomUUID();groups.enqueue(p.player(),id,"mines");
-        db.transaction(c->{update(c,"UPDATE link_group_requests SET expires_at=? WHERE id=?",java.sql.Timestamp.from(java.time.Instant.now().minusSeconds(259200)),id);return null;});
-        assertEquals(1,new EventRetention(db).prune(24,100).requests());assertThrows(ConflictException.class,()->groups.enqueue(p.player(),id,"mines"));
-        assertTrue(network.deleteWarp("mines"));assertThrows(ConflictException.class,()->groups.bind("mines","mine",1,"node-a"));
-    }
     private Transaction change(Session s,UUID op,long expected,String value) {
         return new Transaction(op,List.of(s),List.of(new Change("player:"+s.player(),expected,1,"test:set",value.getBytes(java.nio.charset.StandardCharsets.UTF_8))));
     }
@@ -340,61 +270,6 @@ class DatabaseIntegrationTest {
         db.transaction(c->{update(c,"ALTER TABLE link_operations ADD CONSTRAINT test_retention_reject CHECK (NOT events_pruned)");return null;});
         try{assertThrows(Exception.class,()->new EventRetention(db).prune(24,100));assertEquals(2,events.history("a",0,100).size());}
         finally{db.transaction(c->{update(c,"ALTER TABLE link_operations DROP CONSTRAINT test_retention_reject");return null;});}
-    }
-    @Test void warpLifecycleIsSharedAndStoresLatestState()throws Exception{
-        var first=new Destination("a","shop-world",1.5,65,2.5,90,10);
-        var second=new Destination("b","mall",3,70,4,-45,20);
-        network.setWarp("shop",first);var otherBackend=new NetworkStore(db);
-        assertEquals(first,otherBackend.warp("shop").orElseThrow());assertEquals(List.of("shop"),otherBackend.warps());
-        otherBackend.setWarp("shop",second);assertEquals(second,network.warp("shop").orElseThrow());
-        assertTrue(network.deleteWarp("shop"));assertFalse(otherBackend.deleteWarp("shop"));assertTrue(otherBackend.warps().isEmpty());
-        assertTrue(events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).isEmpty());
-        assertEquals(3,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());assertEquals(0,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().payload().length);
-    }
-    @Test void maximumLengthWarpNameHasBoundedJournalIdentity()throws Exception{
-        String name="w".repeat(160);var destination=new Destination("a","shop",0,65,0,0,0);
-        network.setWarp(name,destination);assertEquals(destination,network.warp(name).orElseThrow());
-        String key=io.linkmc.api.LinkApi.warpStateId(name);assertTrue(key.length()<=160);
-        assertEquals(1,events.read(key).orElseThrow().version());assertTrue(network.deleteWarp(name));assertEquals(2,events.read(key).orElseThrow().version());
-    }
-    @Test void warpOnlyWorldNeverReceivesDefaultSpawnAdmissions()throws Exception{
-        network.heartbeat("a",10);var destination=new Destination("a","shop",5,65,6,90,0);
-        network.setWarp("shop",destination,2);
-        assertThrows(ConflictException.class,()->network.reserve(UUID.randomUUID(),UUID.randomUUID()));
-        assertEquals(0,network.channelCount("a"));assertTrue(network.spawnChannels().isEmpty());
-        var reserved=network.reserve(UUID.randomUUID(),UUID.randomUUID(),destination);assertEquals(destination,reserved.destination());
-        assertThrows(ConflictException.class,()->network.closeWorld("a","shop"));
-        network.cancel(reserved.id(),reserved.player());network.closeWorld("a","shop");
-        assertThrows(ConflictException.class,()->network.reserve(UUID.randomUUID(),UUID.randomUUID(),destination));
-        network.openWarpWorld("a","shop");assertEquals(1,network.channels().size());
-        network.syncWarpWorlds("a",List.of());assertTrue(network.channels().isEmpty());
-        network.syncWarpWorlds("a",List.of("shop"));assertEquals(1,network.channels().size());
-        network.register("a:shop",destination,2);assertTrue(network.spawnChannels().isEmpty());
-    }
-    @Test void warpChannelProjectionAndEventRollbackTogether()throws Exception{
-        network.heartbeat("a",10);
-        db.transaction(c->{update(c,"ALTER TABLE link_outbox ADD CONSTRAINT test_warp_reject CHECK (false)");return null;});
-        try{
-            assertThrows(Exception.class,()->network.setWarp("shop",new Destination("a","shop",0,65,0,0,0),2));
-            assertTrue(network.warp("shop").isEmpty());assertTrue(events.read(io.linkmc.api.LinkApi.warpStateId("shop")).isEmpty());assertTrue(network.channels().isEmpty());
-        }finally{db.transaction(c->{update(c,"ALTER TABLE link_outbox DROP CONSTRAINT test_warp_reject");return null;});}
-        var destination=new Destination("a","shop",0,65,0,0,0);network.setWarp("shop",destination,2);
-        db.transaction(c->{update(c,"DELETE FROM link_outbox");update(c,"ALTER TABLE link_outbox ADD CONSTRAINT test_warp_reject CHECK (false)");return null;});
-        try{
-            assertThrows(Exception.class,()->network.deleteWarp("shop"));
-            assertEquals(destination,network.warp("shop").orElseThrow());assertEquals(1,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());
-        }finally{db.transaction(c->{update(c,"ALTER TABLE link_outbox DROP CONSTRAINT test_warp_reject");return null;});}
-    }
-    @Test void concurrentWarpUpdatesHaveOrderedVersions()throws Exception{
-        try(var executor=Executors.newFixedThreadPool(4)){
-            List<Future<?>> tasks=new ArrayList<>();for(int i=0;i<8;i++){int x=i;tasks.add(executor.submit(()->{network.setWarp("shop",new Destination("a","shop",x,65,0,0,0));return null;}));}
-            for(var task:tasks)task.get();
-        }
-        assertEquals(8,events.read(io.linkmc.api.LinkApi.warpStateId("shop")).orElseThrow().version());assertTrue(events.history(io.linkmc.api.LinkApi.warpStateId("shop"),0,10).isEmpty());
-        try(var service=new LinkService(db)){
-            var tx=new Transaction(UUID.randomUUID(),List.of(),List.of(new Change(io.linkmc.api.LinkApi.warpStateId("shop"),8,1,"bad",new byte[]{1})));
-            assertThrows(ExecutionException.class,()->service.data().commit(tx).toCompletableFuture().get());
-        }
     }
     private Session tpPlayer(String name,String node)throws Exception{
         network.heartbeat(node,20);Session owner=sessions.acquire(UUID.randomUUID(),node);new TeleportStore(db).registerPlayer(owner.player(),name);return owner;
@@ -541,25 +416,6 @@ class DatabaseIntegrationTest {
         network.depart(owner);sessions.release(owner);
         assertNotNull(network.reserve(UUID.randomUUID(),UUID.randomUUID()));
     }
-    @Test void templatesCannotBeOverwrittenAndVerifyDigest() throws Exception {
-        TemplateStore store=new TemplateStore(db);byte[] original={1,2,3};
-        assertTrue(store.find("lobby",1).isEmpty());
-        assertThrows(ConflictException.class,() -> store.read("lobby",1));
-        store.publish("lobby",1,original);store.publish("lobby",1,original);
-        assertThrows(ConflictException.class,() -> store.publish("lobby",1,new byte[]{4}));
-        assertArrayEquals(original,store.read("lobby",1));
-        db.transaction(c -> {update(c,"UPDATE link_templates SET payload=?",new byte[]{9});return null;});
-        assertThrows(ConflictException.class,() -> store.read("lobby",1));
-        assertThrows(ConflictException.class,() -> store.find("lobby",1));
-    }
-    @Test void failedObjectUploadNeverPublishesTemplate()throws Exception{
-        var storage=new WorldBlobsTest.Memory();storage.unavailable=true;db.worldStorage(storage);
-        var templates=new TemplateStore(db);
-        assertThrows(java.io.IOException.class,()->templates.publish("failed",1,new byte[]{1}));
-        assertTrue(templates.find("failed",1).isEmpty());
-        storage.unavailable=false;templates.publish("ok",1,new byte[]{1,2});
-        assertArrayEquals(new byte[]{1,2},templates.read("ok",1));
-    }
     @Test void nativeRecoveryPrefixIsLiteralAndOrdered()throws Exception{
         assertTrue(events.prefix("native:test_a/").isEmpty());
         events.commit(new Transaction(UUID.randomUUID(),List.of(),List.of(
@@ -689,7 +545,7 @@ class DatabaseIntegrationTest {
             catch(Exception e){throw new AssertionError(e);}
             observed.set(request);
         })){
-            var reservation=service.network().requestTravel(player,operation,null).toCompletableFuture().get(5,TimeUnit.SECONDS);
+            var reservation=service.network().requestTravel(player,operation,new Destination("a","spawn",0,65,0,0,0)).toCompletableFuture().get(5,TimeUnit.SECONDS);
             assertEquals(new RouteStore.Request(operation,reservation),observed.get());
             var routes=new RouteStore(db);routes.finish(operation,true);
             routes.ready(operation);assertEquals("COMPLETE",routes.status(operation));
@@ -700,7 +556,7 @@ class DatabaseIntegrationTest {
         network.heartbeat("a",2);network.register("one",new Destination("a","spawn",0,65,0,0,0),2);
         UUID player=UUID.randomUUID(),operation=UUID.randomUUID();sessions.acquire(player,"a");
         try(var service=new LinkService(db,request->{throw new IllegalStateException("scheduler unavailable");})){
-            service.network().requestTravel(player,operation,null).toCompletableFuture().get(5,TimeUnit.SECONDS);
+            service.network().requestTravel(player,operation,new Destination("a","spawn",0,65,0,0,0)).toCompletableFuture().get(5,TimeUnit.SECONDS);
             assertEquals(operation,new RouteStore(db).pending("a").getFirst().id());
         }
     }

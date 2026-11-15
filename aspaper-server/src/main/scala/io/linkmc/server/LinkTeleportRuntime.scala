@@ -46,7 +46,7 @@ final class LinkTeleportRuntime private[server] (db: Database, service: LinkServ
     else {
       val host = if (task.request.here()) task.request.requester() else task.request.recipient()
       val player = Bukkit.getPlayer(host)
-      if (player == null || !player.isOnline() || NativeJournalImpl.moving(host) || player.getPersistentDataContainer().has(LinkEditors.KEY, PersistentDataType.STRING)) {
+      if (player == null || !player.isOnline() || NativeJournalImpl.moving(host)) {
         service.rejectTeleport(id).whenComplete((v: Void, e: Throwable) => { busy.remove(id); () })
       } else {
         val location = player.getLocation()
